@@ -1,0 +1,59 @@
+# Local Python environment and interpreter caches
+.venv/
+__pycache__/
+*.py[cod]
+*$py.class
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.ipynb_checkpoints/
+
+# Local secrets or machine-specific environment overrides
+.env
+.env.*
+
+# Generated experiment outputs, teacher caches, checkpoints, and dashboards
+outputs/
+runs/
+logs/
+wandb/
+mlruns/
+*.log
+
+# Local input / comparison artifacts used for one-off Isaac or depth experiments
+rgb.png
+compare/
+
+# Dataset payloads. Keep dataset loader source code, ignore raw/downloaded data.
+data/
+dataset/
+datasets/**/data/
+datasets/**/raw/
+datasets/**/processed/
+datasets/**/cache/
+datasets/**/downloads/
+*.mat
+*.h5
+*.hdf5
+
+# Model parameters and exported inference engines
+checkpoints/
+weights/
+*.pt
+*.pth
+*.ckpt
+*.safetensors
+*.onnx
+*.engine
+*.bin
+
+# Large generated numerical / point-cloud artifacts
+*.npy
+*.npz
+*.ply
+*.pcd
+*.las
+*.laz
+
+# Keep room for small committed test fixtures if needed later.
+!tests/fixtures/**
