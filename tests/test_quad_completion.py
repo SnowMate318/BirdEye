@@ -16,6 +16,7 @@ from wide_fov_supervision_v2.modules.quad_completion.geometry import (
 )
 from wide_fov_supervision_v2.modules.quad_completion.model import QuadCompletionResult, QuadRayCompletionModel
 from wide_fov_supervision_v2.modules.query_geometry import normals_from_stencil_depths
+from wide_fov_supervision_v2.train.trainer import predict_batch_with_stencils
 
 
 def _inputs(batch: int = 2, queries: int = 7):
@@ -81,6 +82,30 @@ def test_public_interface_contains_only_four_support_and_query_inputs() -> None:
         "query_relative_uv",
         "query_mask",
     ]
+
+
+def test_training_prediction_skips_stencil_forward_when_normal_is_disabled() -> None:
+    model = QuadRayCompletionModel(CompletionConfig(hidden_dim=32, attention_heads=4, attention_blocks=1))
+    support_rays, support_rgb, support_depth, support_valid, query_rays, query_uv, query_mask = _inputs(batch=1, queries=5)
+    batch = {
+        "support_ray_dir": support_rays,
+        "support_rgb": support_rgb,
+        "support_depth_z": support_depth,
+        "support_valid": support_valid,
+        "query_ray_dir": query_rays,
+        "query_relative_uv": query_uv,
+        "query_mask": query_mask,
+    }
+    result, pred_normal, target_normal, normal_mask = predict_batch_with_stencils(
+        model,
+        batch,
+        z_eps=1.0e-3,
+        compute_normals=False,
+    )
+    assert result.depth_z.shape == (1, 5)
+    assert pred_normal is None
+    assert target_normal is None
+    assert normal_mask is None
 
 
 def test_continuous_confidence_is_one_and_depth_step_is_zero() -> None:
@@ -183,6 +208,27 @@ def test_cycle_reconstruction_loss_ignores_corner_queries() -> None:
     assert float(loss.cycle.detach()) == 0.0
 
 
+def test_cycle_reconstruction_loss_requires_continuous_source() -> None:
+    inputs = _inputs(batch=1, queries=6)
+    result = QuadRayCompletionModel(CompletionConfig(hidden_dim=32, attention_heads=4, attention_blocks=1))(*inputs)
+    loss = QuadCompletionLoss(LossConfig(cycle_reconstruction_weight=1.0), StageToggles())(
+        result=result,
+        support_rgb=inputs[1],
+        support_depth_z=inputs[2],
+        support_valid=inputs[3],
+        query_relative_uv=inputs[5],
+        source_continuous=torch.zeros(1, dtype=torch.bool),
+        target_rgb=result.rgb.detach(),
+        target_depth_z=result.depth_z.detach(),
+        target_valid=torch.ones(1, 6, dtype=torch.bool),
+        target_confidence=torch.ones(1, 6, dtype=torch.bool),
+        query_mask=inputs[-1],
+        corner_query_mask=torch.zeros(1, 6, dtype=torch.bool),
+    )
+    assert loss.cycle_count == 0
+    assert float(loss.cycle.detach()) == 0.0
+
+
 def test_normal_loss_backpropagates_to_depth_residual_head() -> None:
     model = QuadRayCompletionModel(CompletionConfig(hidden_dim=32, attention_heads=4, attention_blocks=1))
     support_rays, support_rgb, support_depth, support_valid, _, _, _ = _inputs(batch=1, queries=1)
@@ -206,7 +252,12 @@ def test_normal_loss_backpropagates_to_depth_residual_head() -> None:
     pred_normal, normal_valid = normals_from_stencil_depths(
         center.depth_z, stencil.depth_z.reshape(1, 1, 4), center_ray, stencil_rays
     )
-    losses = QuadCompletionLoss(LossConfig(), StageToggles())(
+    toggles = StageToggles()
+    toggles.enable_depth_loss = False
+    toggles.enable_rgb_loss = False
+    toggles.enable_normal_loss = True
+    toggles.enable_cycle_loss = False
+    losses = QuadCompletionLoss(LossConfig(), toggles)(
         result=center,
         support_depth_z=support_depth,
         support_valid=support_valid,

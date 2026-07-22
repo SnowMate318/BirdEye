@@ -65,6 +65,7 @@ def _reverse_cycle_loss(
     support_depth_z: torch.Tensor,
     support_valid: torch.Tensor,
     query_relative_uv: torch.Tensor | None,
+    source_continuous: torch.Tensor | None,
     query_mask: torch.Tensor,
     target_valid: torch.Tensor,
     target_confidence: torch.Tensor,
@@ -103,6 +104,13 @@ def _reverse_cycle_loss(
         & torch.isfinite(work_depth)
         & (work_depth > 1.0e-4)
     )
+    if source_continuous is not None:
+        # Cycle reconstruction은 하나의 bilinear RGB-D patch가 support 2x2를
+        # 설명한다는 가정에 의존한다. 경계/불연속 quad에 이 가정을 걸면
+        # foreground-background 중간층과 RGB 번짐을 만들 수 있으므로,
+        # manifest에서 연속 표면으로 판정된 sample에만 적용한다.
+        continuous = source_continuous.bool().reshape(-1)
+        cycle_query_mask &= continuous[:, None]
     enough_queries = cycle_query_mask.sum(dim=-1) >= int(config.cycle_min_internal_queries)
 
     basis = _bilinear_basis(torch.nan_to_num(work_relative_uv))
@@ -182,6 +190,7 @@ class QuadCompletionLoss:
         corner_query_mask: torch.Tensor,
         support_rgb: torch.Tensor | None = None,
         query_relative_uv: torch.Tensor | None = None,
+        source_continuous: torch.Tensor | None = None,
         pred_normal: torch.Tensor | None = None,
         target_normal: torch.Tensor | None = None,
         normal_mask: torch.Tensor | None = None,
@@ -244,6 +253,7 @@ class QuadCompletionLoss:
             support_depth_z=support_depth_z,
             support_valid=support_valid,
             query_relative_uv=query_relative_uv,
+            source_continuous=source_continuous,
             query_mask=query_mask,
             target_valid=target_valid,
             target_confidence=target_confidence,
@@ -261,7 +271,8 @@ class QuadCompletionLoss:
             total = total + self.config.confidence_weight * confidence_loss
         if self.toggles.enable_normal_loss:
             total = total + self.config.normal_weight * normal_loss
-        total = total + self.config.residual_weight * residual_loss
+        if self.toggles.enable_residual_loss:
+            total = total + self.config.residual_weight * residual_loss
         if self.toggles.enable_cycle_loss:
             total = total + self.config.cycle_reconstruction_weight * cycle_loss
         return CompletionLossResult(

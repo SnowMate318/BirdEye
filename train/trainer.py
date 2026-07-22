@@ -25,6 +25,7 @@ def predict_batch_with_stencils(
     batch: dict[str, torch.Tensor],
     *,
     z_eps: float,
+    compute_normals: bool = True,
 ) -> tuple:
     """중심 query와 relative-UV stencil을 한 모델로 예측해 N*과 GT normal을 만든다."""
 
@@ -37,6 +38,8 @@ def predict_batch_with_stencils(
         batch["query_relative_uv"],
         batch["query_mask"],
     )
+    if not compute_normals:
+        return result, None, None, None
     b, q = batch["query_mask"].shape
     stencil_result = model(
         batch["support_ray_dir"],
@@ -121,7 +124,10 @@ def train_completion_model(config: PipelineConfig) -> Path:
             optimizer.zero_grad(set_to_none=True)
             with torch.amp.autocast(device_type=device.type, enabled=config.train.amp and device.type == "cuda"):
                 result, pred_normal, target_normal, normal_mask = predict_batch_with_stencils(
-                    model, batch, z_eps=config.camera.geometry_z_eps
+                    model,
+                    batch,
+                    z_eps=config.camera.geometry_z_eps,
+                    compute_normals=bool(config.toggles.enable_normal_loss),
                 )
                 losses = loss_fn(
                     result=result,
@@ -129,6 +135,7 @@ def train_completion_model(config: PipelineConfig) -> Path:
                     support_depth_z=batch["support_depth_z"],
                     support_valid=batch["support_valid"],
                     query_relative_uv=batch["query_relative_uv"],
+                    source_continuous=batch["source_continuous"],
                     target_rgb=batch["target_rgb"],
                     target_depth_z=batch["target_depth_z"],
                     target_valid=batch["target_valid"],

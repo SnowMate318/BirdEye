@@ -21,9 +21,10 @@ class StageToggles:
     enable_completion: bool = True
     enable_depth_loss: bool = True
     enable_rgb_loss: bool = True
-    enable_valid_loss: bool = True
-    enable_confidence_loss: bool = True
-    enable_normal_loss: bool = True
+    enable_valid_loss: bool = False
+    enable_confidence_loss: bool = False
+    enable_normal_loss: bool = False
+    enable_residual_loss: bool = False
     enable_cycle_loss: bool = True
     enable_bev: bool = True
     enable_floor_surface_rasterization: bool = True
