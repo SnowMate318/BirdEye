@@ -9,47 +9,37 @@ if __package__ is None or __package__ == "":
     sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from wide_fov_supervision_v2.config import ensure_output_roots, make_default_config
+from wide_fov_supervision_v2.datasets.nyu.quad_dataset import build_nyu_quad_manifest
 from wide_fov_supervision_v2.pipeline import run_inference, validate_environment
-from wide_fov_supervision_v2.train.cache import build_nyu_teacher_cache
 from wide_fov_supervision_v2.train.evaluate import evaluate_cached_predictions
-from wide_fov_supervision_v2.train.query_cache import build_nyu_query_sidecar_cache
-from wide_fov_supervision_v2.train.trainer import train_refiner
+from wide_fov_supervision_v2.train.trainer import train_completion_model
 
 
 def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="wide_fov_supervision_v2 adaptive ray/refiner pipeline")
+    parser = argparse.ArgumentParser(description="Convex Quad 기반 RGB-D Ray Completion 파이프라인")
     parser.add_argument("--mode", choices=["validate", "cache", "train", "evaluate", "infer", "all"], default="infer")
-    parser.add_argument("--checkpoint", type=Path, default=None, help="refiner checkpoint path")
-    parser.add_argument("--input-rgb", type=Path, default=None, help="override input rgb path")
+    parser.add_argument("--checkpoint", type=Path, default=None, help="Quad completion checkpoint path")
+    parser.add_argument("--input-rgb", type=Path, default=None)
     parser.add_argument(
         "--depth-source",
         choices=["da_v2", "external_npy"],
         default=None,
-        help="inference D0 source: metric DA-V2 or a pixel-aligned external z-depth NPY",
+        help="fisheye 2x2 support에 사용할 z-depth source",
     )
-    parser.add_argument(
-        "--depth-npy",
-        type=Path,
-        default=None,
-        help="external_npy mode source-camera z-depth path (H,W float array in metres)",
-    )
+    parser.add_argument("--depth-npy", type=Path, default=None, help="external_npy z-depth (H,W, metre)")
     parser.add_argument("--disable-direct", action="store_true")
     parser.add_argument("--disable-tangent", action="store_true")
     parser.add_argument("--disable-html", action="store_true")
     parser.add_argument("--disable-bev", action="store_true")
-    parser.add_argument("--disable-dense-coverage", action="store_true")
+    parser.add_argument("--disable-completion", action="store_true")
+    parser.add_argument("--disable-amp", action="store_true", help="train/eval 모델 계산에서 AMP mixed precision을 끕니다.")
     parser.add_argument("--max-train-items", type=int, default=None)
     parser.add_argument("--max-eval-items", type=int, default=None)
-    parser.add_argument("--max-queries", type=int, default=None, help="debug용 query cap. 기본은 cap 없음")
-    parser.add_argument("--epochs", type=int, default=None, help="debug/trial용 epoch override")
-    parser.add_argument("--batch-size", type=int, default=None, help="debug/trial용 batch size override")
-    parser.add_argument(
-        "--dense-subdivision",
-        type=int,
-        default=None,
-        help="source 2x2 cell dense BEV subdivision. 5 is fast, 7/9 recovers more cells.",
-    )
-    parser.add_argument("--dense-chunk-cells", type=int, default=None)
+    parser.add_argument("--max-queries", type=int, default=None)
+    parser.add_argument("--floor-edge-boost", type=float, default=None)
+    parser.add_argument("--floor-edge-margin", type=float, default=None)
+    parser.add_argument("--epochs", type=int, default=None)
+    parser.add_argument("--batch-size", type=int, default=None)
     return parser.parse_args()
 
 
@@ -70,18 +60,22 @@ def apply_overrides(config, args: argparse.Namespace):
         config.toggles.enable_html = False
     if args.disable_bev:
         config.toggles.enable_bev = False
-    if args.disable_dense_coverage:
-        config.toggles.enable_dense_coverage_bev = False
+    if args.disable_completion:
+        config.toggles.enable_completion = False
+    if args.disable_amp:
+        config.train.amp = False
+        config.backbone.use_amp_for_backbone = False
     if args.max_train_items is not None:
         config.train.max_train_items = args.max_train_items
     if args.max_eval_items is not None:
         config.train.max_eval_items = args.max_eval_items
     if args.max_queries is not None:
         config.ray.max_queries_per_inference = args.max_queries
-    if args.dense_subdivision is not None:
-        config.ray.dense_coverage_subdivision = args.dense_subdivision
-    if args.dense_chunk_cells is not None:
-        config.ray.dense_coverage_chunk_cells = args.dense_chunk_cells
+        config.ray.max_added_queries_inference = args.max_queries
+    if args.floor_edge_boost is not None:
+        config.ray.floor_edge_priority_weight = args.floor_edge_boost
+    if args.floor_edge_margin is not None:
+        config.ray.floor_edge_height_margin_m = args.floor_edge_margin
     if args.epochs is not None:
         config.train.epochs = args.epochs
     if args.batch_size is not None:
@@ -93,20 +87,16 @@ def main() -> int:
     args = parse_args()
     config = apply_overrides(make_default_config(), args)
     ensure_output_roots(config)
-
     if args.mode == "validate":
-        checks = validate_environment(config)
-        print(json.dumps(checks, indent=2, ensure_ascii=False))
+        print(json.dumps(validate_environment(config), indent=2, ensure_ascii=False))
         return 0
     if args.mode == "cache":
-        build_nyu_teacher_cache(config, split="train")
-        build_nyu_teacher_cache(config, split="test")
-        build_nyu_query_sidecar_cache(config, split="train")
-        build_nyu_query_sidecar_cache(config, split="test")
+        build_nyu_quad_manifest(config, "train")
+        build_nyu_quad_manifest(config, "test")
         return 0
     if args.mode == "train":
-        ckpt = train_refiner(config)
-        print(f"checkpoint={ckpt}")
+        checkpoint = train_completion_model(config)
+        print(f"checkpoint={checkpoint}")
         return 0
     if args.mode == "evaluate":
         metrics = evaluate_cached_predictions(config)
@@ -117,12 +107,10 @@ def main() -> int:
         print(f"run_dir={run_dir}")
         return 0
     if args.mode == "all":
-        build_nyu_teacher_cache(config, split="train")
-        build_nyu_teacher_cache(config, split="test")
-        build_nyu_query_sidecar_cache(config, split="train")
-        build_nyu_query_sidecar_cache(config, split="test")
-        ckpt = train_refiner(config)
-        config.paths.checkpoint = ckpt
+        build_nyu_quad_manifest(config, "train")
+        build_nyu_quad_manifest(config, "test")
+        checkpoint = train_completion_model(config)
+        config.paths.checkpoint = checkpoint
         evaluate_cached_predictions(config)
         run_dir = run_inference(config)
         print(f"run_dir={run_dir}")

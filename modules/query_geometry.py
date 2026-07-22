@@ -7,7 +7,8 @@ import torch.nn.functional as F
 def normalize_vector(value: torch.Tensor, eps: float = 1.0e-8) -> torch.Tensor:
     """마지막 축 vector를 단위화한다."""
 
-    return value / value.norm(dim=-1, keepdim=True).clamp_min(eps)
+    dtype_eps = torch.finfo(value.dtype).eps if value.dtype.is_floating_point else eps
+    return value / value.norm(dim=-1, keepdim=True).clamp_min(max(float(eps), float(dtype_eps)))
 
 
 def pixel_uv_to_grid(uv: torch.Tensor, height: int, width: int) -> torch.Tensor:
@@ -128,6 +129,14 @@ def normals_from_stencil_depths(
         valid: `(B, Q)` 중심과 네 stencil depth/ray가 모두 valid한지 여부.
     """
 
+    # AMP half precision에서는 거의 퇴화된 stencil의 cross product가 0에 가까워져
+    # normalize backward가 NaN/Inf를 만들 수 있다. 보조 normal loss의 geometry는
+    # float32로 계산하고, 길이가 작은 법선은 loss mask 밖으로 뺀다.
+    center_depth_z = center_depth_z.float()
+    stencil_depth_z = stencil_depth_z.float()
+    center_rays = center_rays.float()
+    stencil_rays = stencil_rays.float()
+
     _, center_valid = z_depth_to_points(center_depth_z, center_rays, z_eps=z_eps)
     stencil_points, stencil_valid = z_depth_to_points(stencil_depth_z, stencil_rays, z_eps=z_eps)
     p_left = stencil_points[:, :, 0]
@@ -136,9 +145,11 @@ def normals_from_stencil_depths(
     p_down = stencil_points[:, :, 3]
     tangent_x = p_right - p_left
     tangent_y = p_down - p_up
-    normals = torch.cross(tangent_x, tangent_y, dim=-1)
-    normals = normalize_vector(normals, eps=eps)
-    valid = center_valid & stencil_valid.all(dim=-1) & torch.isfinite(normals).all(dim=-1)
+    normals_raw = torch.cross(tangent_x, tangent_y, dim=-1)
+    normal_norm = normals_raw.norm(dim=-1)
+    normal_eps = max(float(eps), 1.0e-6)
+    normals = normals_raw / normal_norm.clamp_min(normal_eps).unsqueeze(-1)
+    valid = center_valid & stencil_valid.all(dim=-1) & (normal_norm > normal_eps) & torch.isfinite(normals).all(dim=-1)
 
     # normal 방향은 camera-facing으로 맞춘다. ray는 camera->surface이므로
     # normal dot ray가 양수면 카메라 반대쪽을 향하는 것으로 보고 뒤집는다.

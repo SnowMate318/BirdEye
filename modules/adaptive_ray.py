@@ -48,6 +48,7 @@ class RayQuerySet:
     subdivision_u: np.ndarray
     subdivision_v: np.ndarray
     sampling_features: np.ndarray
+    source_cell_continuous: np.ndarray
     observed: np.ndarray
     added: np.ndarray
     unknown: np.ndarray
@@ -77,6 +78,7 @@ class RayQuerySet:
             "subdivision_v": self.subdivision_v,
             "subdivision": self.subdivision,
             "sampling_features": self.sampling_features,
+            "source_cell_continuous": self.source_cell_continuous,
             "observed": self.observed,
             "added": self.added,
             "unknown": self.unknown,
@@ -99,6 +101,7 @@ class RayQuerySet:
             subdivision_u=self.subdivision_u[mask],
             subdivision_v=self.subdivision_v[mask],
             sampling_features=self.sampling_features[mask],
+            source_cell_continuous=self.source_cell_continuous[mask],
             observed=self.observed[mask],
             added=self.added[mask],
             unknown=self.unknown[mask],
@@ -128,6 +131,7 @@ class AdaptiveRayResult:
     bev_gap_planned_after_cells: np.ndarray
     sampling_priority: np.ndarray
     eligible_mask: np.ndarray
+    depth_continuous_mask: np.ndarray
     subdivision_u: np.ndarray
     subdivision_v: np.ndarray
     added_density: np.ndarray
@@ -150,6 +154,7 @@ def _empty_query_set() -> RayQuerySet:
         subdivision_u=np.zeros((0,), dtype=np.int16),
         subdivision_v=np.zeros((0,), dtype=np.int16),
         sampling_features=np.zeros((0, 3), dtype=np.float32),
+        source_cell_continuous=np.zeros((0,), dtype=bool),
         observed=np.zeros((0,), dtype=bool),
         added=np.zeros((0,), dtype=bool),
         unknown=np.zeros((0,), dtype=bool),
@@ -243,6 +248,31 @@ def _query_budget(config: RaySamplerConfig, mode: SamplingMode) -> int:
     return max(0, budget)
 
 
+def _bev_cell_key(point_world: np.ndarray, bev_config: BevConfig) -> int | None:
+    """world point가 들어가는 BEV cell key를 반환한다.
+
+    반환값은 ``row * resolution + col``이다. BEV bounds 밖이거나 non-finite point면
+    ``None``을 반환한다. sampler 안에서는 continuous/floor query가 같은 BEV cell에
+    과도하게 중복 배정되는 것을 막는 용도로만 사용한다.
+    """
+
+    point = np.asarray(point_world, dtype=np.float64)
+    if not np.isfinite(point[:2]).all():
+        return None
+    half = float(bev_config.size_m) * 0.5
+    min_x = float(bev_config.center_xy[0]) - half
+    min_y = float(bev_config.center_xy[1]) - half
+    max_x = float(bev_config.center_xy[0]) + half
+    max_y = float(bev_config.center_xy[1]) + half
+    if point[0] < min_x or point[0] >= max_x or point[1] < min_y or point[1] >= max_y:
+        return None
+    col = int(np.floor((point[0] - min_x) / max(float(bev_config.meters_per_pixel), 1.0e-8)))
+    row = int(bev_config.resolution - 1 - np.floor((point[1] - min_y) / max(float(bev_config.meters_per_pixel), 1.0e-8)))
+    if row < 0 or row >= bev_config.resolution or col < 0 or col >= bev_config.resolution:
+        return None
+    return row * bev_config.resolution + col
+
+
 def _empty_guided_result(
     shape: tuple[int, int],
     *,
@@ -266,6 +296,7 @@ def _empty_guided_result(
         bev_gap_planned_after_cells=nan_map.copy(),
         sampling_priority=nan_map.copy(),
         eligible_mask=np.zeros(shape, dtype=bool),
+        depth_continuous_mask=np.zeros(shape, dtype=bool),
         subdivision_u=zero_i16.copy(),
         subdivision_v=zero_i16.copy(),
         added_density=np.zeros(shape, dtype=np.float32),
@@ -296,6 +327,7 @@ def generate_source_queries(rays_cv: np.ndarray, valid: np.ndarray) -> RayQueryS
         subdivision_u=np.ones(count, dtype=np.int16),
         subdivision_v=np.ones(count, dtype=np.int16),
         sampling_features=np.zeros((count, 3), dtype=np.float32),
+        source_cell_continuous=np.ones(count, dtype=bool),
         observed=np.ones(count, dtype=bool),
         added=np.zeros(count, dtype=bool),
         unknown=np.zeros(count, dtype=bool),
@@ -409,12 +441,34 @@ def generate_guided_observed_queries(
         eligible = angular_cell_valid
         ratio_u, ratio_v = angular_ratio_u, angular_ratio_v
     elif mode == "surface":
-        eligible = angular_cell_valid & depth_continuous
+        eligible = angular_cell_valid & depth_cell_valid
         ratio_u, ratio_v = surface_ratio_u, surface_ratio_v
     else:
-        eligible = angular_cell_valid & depth_continuous & bev_cell_valid
+        eligible = angular_cell_valid & depth_cell_valid & bev_cell_valid
         ratio_u = np.maximum(surface_ratio_u, bev_ratio_u)
         ratio_v = np.maximum(surface_ratio_v, bev_ratio_v)
+
+    if mode == "surface_bev" and float(sampler_config.floor_edge_priority_weight) > 0.0:
+        in_bev_z = points_world[..., 2][point_valid & world_point_in_bev]
+        if in_bev_z.size > 0:
+            floor_height = float(np.nanpercentile(in_bev_z, float(bev_config.floor_height_percentile)))
+            z00, z10 = points_world[:-1, :-1, 2], points_world[:-1, 1:, 2]
+            z01, z11 = points_world[1:, :-1, 2], points_world[1:, 1:, 2]
+            cell_z_max = np.maximum(np.maximum(z00, z10), np.maximum(z01, z11))
+            floor_like = (
+                depth_continuous
+                & bev_cell_valid
+                & np.isfinite(cell_z_max)
+                & (cell_z_max <= floor_height + float(sampler_config.floor_edge_height_margin_m))
+            )
+            yy, xx = np.indices(cell_shape, dtype=np.float32)
+            radius = np.sqrt((xx + 1.0 - float(camera.cx)) ** 2 + (yy + 1.0 - float(camera.cy)) ** 2)
+            valid_radius = radius[eligible]
+            radius_scale = float(np.nanmax(valid_radius)) if valid_radius.size > 0 else 1.0
+            radius01 = np.clip(radius / max(radius_scale, 1.0e-8), 0.0, 1.0)
+            floor_boost = 1.0 + float(sampler_config.floor_edge_priority_weight) * radius01
+            ratio_u = np.where(floor_like, ratio_u * floor_boost, ratio_u)
+            ratio_v = np.where(floor_like, ratio_v * floor_boost, ratio_v)
 
     finite_ratio = np.isfinite(ratio_u) & np.isfinite(ratio_v)
     eligible &= finite_ratio
@@ -449,6 +503,14 @@ def generate_guided_observed_queries(
         bev_u_cells[eligible] / safe_sub_u[eligible], bev_v_cells[eligible] / safe_sub_v[eligible]
     )
 
+    prefer_new_continuous_bev = (
+        mode == "surface_bev"
+        and bool(sampler_config.prefer_new_bev_cells_for_continuous_queries)
+    )
+    continuous_bev_seen: set[int] = set()
+    world_from_camera = np.asarray(camera.world_from_camera, dtype=np.float64)
+    camera_position_world = np.asarray(camera.camera_position_world, dtype=np.float64)
+
     ys, xs = np.nonzero(add_mask)
     per_cell_candidates = (
         (subdivision_u[ys, xs].astype(np.int64) + 1)
@@ -460,8 +522,25 @@ def generate_guided_observed_queries(
         queries = _empty_query_set()
         added_density = np.zeros(cell_shape, dtype=np.float32)
     else:
-        # score 내림차순, 같은 score에서는 y/x 오름차순으로 항상 같은 query를 고른다.
-        order = np.lexsort((xs, ys, -score[ys, xs]))
+        # 각 branch가 비교 가능한 query를 갖도록 continuous/edge cell을 번갈아
+        # interleave한다. 각 pool 안에서는 score 내림차순, y/x 오름차순이라 같은
+        # 입력/config에서 결과가 항상 같다. 그렇지 않으면 큰 depth jump의 score가
+        # 예산을 독점해 continuous_only baseline이 비는 문제가 생긴다.
+        ranked = np.lexsort((xs, ys, -score[ys, xs]))
+        ranked_continuous = ranked[depth_continuous[ys[ranked], xs[ranked]]]
+        ranked_edge = ranked[~depth_continuous[ys[ranked], xs[ranked]]]
+        ordered: list[int] = []
+        continuous_index = edge_index = 0
+        while continuous_index < len(ranked_continuous) or edge_index < len(ranked_edge):
+            take_continuous = min(1, len(ranked_continuous) - continuous_index)
+            if take_continuous > 0:
+                ordered.extend(ranked_continuous[continuous_index : continuous_index + take_continuous].tolist())
+                continuous_index += take_continuous
+            take_edge = min(1, len(ranked_edge) - edge_index)
+            if take_edge > 0:
+                ordered.extend(ranked_edge[edge_index : edge_index + take_edge].tolist())
+                edge_index += take_edge
+        order = np.asarray(ordered, dtype=np.int64)
         scale = 10 ** int(sampler_config.dedupe_uv_decimals)
         seen_uv: set[tuple[int, int]] = set()
         records: list[tuple] = []
@@ -489,8 +568,30 @@ def generate_guided_observed_queries(
                     key = tuple(np.rint(source_uv * scale).astype(np.int64).tolist())
                     if key in seen_uv:
                         continue
-                    seen_uv.add(key)
                     ray = spherical_bilerp(r00, r10, r01, r11, np.array(rel_u), np.array(rel_v))
+                    if prefer_new_continuous_bev and bool(depth_continuous[y, x]):
+                        d00, d10 = depth[y, x], depth[y, x + 1]
+                        d01, d11 = depth[y + 1, x], depth[y + 1, x + 1]
+                        top_depth = (1.0 - rel_u) * d00 + rel_u * d10
+                        bottom_depth = (1.0 - rel_u) * d01 + rel_u * d11
+                        query_depth_z = (1.0 - rel_v) * top_depth + rel_v * bottom_depth
+                        ray_flat = ray.reshape(3).astype(np.float64)
+                        if (
+                            not np.isfinite(query_depth_z)
+                            or query_depth_z <= 0.0
+                            or not np.isfinite(ray_flat).all()
+                            or ray_flat[2] <= float(camera.geometry_z_eps)
+                        ):
+                            continue
+                        point_cv = ray_flat * (float(query_depth_z) / float(ray_flat[2]))
+                        point_camera = point_cv.copy()
+                        point_camera[1] *= -1.0
+                        point_world = camera_position_world + point_camera @ world_from_camera.T
+                        bev_key = _bev_cell_key(point_world, bev_config)
+                        if bev_key is None or bev_key in continuous_bev_seen:
+                            continue
+                        continuous_bev_seen.add(bev_key)
+                    seen_uv.add(key)
                     records.append(
                         (
                             ray.reshape(3),
@@ -504,6 +605,7 @@ def generate_guided_observed_queries(
                             sub_u,
                             sub_v,
                             features,
+                            bool(depth_continuous[y, x]),
                         )
                     )
                     if len(records) >= budget:
@@ -529,6 +631,7 @@ def generate_guided_observed_queries(
                 subdivision_u=np.asarray([item[8] for item in records], dtype=np.int16),
                 subdivision_v=np.asarray([item[9] for item in records], dtype=np.int16),
                 sampling_features=np.asarray([item[10] for item in records], dtype=np.float32),
+                source_cell_continuous=np.asarray([item[11] for item in records], dtype=bool),
                 observed=np.ones(count, dtype=bool),
                 added=np.ones(count, dtype=bool),
                 unknown=np.zeros(count, dtype=bool),
@@ -559,6 +662,7 @@ def generate_guided_observed_queries(
         bev_gap_planned_after_cells=bev_after,
         sampling_priority=priority,
         eligible_mask=eligible,
+        depth_continuous_mask=depth_continuous,
         subdivision_u=subdivision_u,
         subdivision_v=subdivision_v,
         added_density=added_density,
@@ -631,6 +735,7 @@ def generate_adaptive_observed_queries(
         sampling_features=np.column_stack(
             [angular / max(target_gap, 1.0e-8), np.zeros(count), np.zeros(count)]
         ).astype(np.float32),
+        source_cell_continuous=np.ones(count, dtype=bool),
         observed=np.ones(count, dtype=bool),
         added=np.ones(count, dtype=bool),
         unknown=np.zeros(count, dtype=bool),
@@ -710,6 +815,7 @@ def generate_front_hemisphere_queries(
         subdivision_u=np.ones(count, dtype=np.int16),
         subdivision_v=np.ones(count, dtype=np.int16),
         sampling_features=np.zeros((count, 3), dtype=np.float32),
+        source_cell_continuous=np.zeros(count, dtype=bool),
         observed=observed,
         added=np.zeros(count, dtype=bool),
         unknown=unknown,
@@ -735,6 +841,7 @@ def merge_query_sets(query_sets: Iterable[RayQuerySet], config: RaySamplerConfig
         subdivision_u=np.concatenate([query.subdivision_u for query in sets], axis=0),
         subdivision_v=np.concatenate([query.subdivision_v for query in sets], axis=0),
         sampling_features=np.concatenate([query.sampling_features for query in sets], axis=0),
+        source_cell_continuous=np.concatenate([query.source_cell_continuous for query in sets], axis=0),
         observed=np.concatenate([query.observed for query in sets], axis=0),
         added=np.concatenate([query.added for query in sets], axis=0),
         unknown=np.concatenate([query.unknown for query in sets], axis=0),

@@ -66,8 +66,8 @@ def test_surface_sampler_concentrates_queries_at_wide_fov_edge() -> None:
     assert result.budget_truncated
 
 
-def test_depth_discontinuity_cells_are_not_subdivided() -> None:
-    """큰 depth jump를 가로지르는 cell에는 가짜 중간 surface query를 만들지 않는다."""
+def test_depth_discontinuity_cells_are_candidates_with_continuity_metadata() -> None:
+    """경계 cell도 후보로 만들되 completion filtering용 연속성 flag는 false여야 한다."""
 
     height, width = 6, 7
     rays = _anisotropic_rays(height, width, step_u=0.08, step_v=0.04)
@@ -89,9 +89,11 @@ def test_depth_discontinuity_cells_are_not_subdivided() -> None:
         mode="surface",
     )
 
-    assert not np.any(result.eligible_mask[:, 2])
-    assert np.all(result.subdivision_u[:, 2] == 0)
-    assert not np.any(result.queries.parent_cell[:, 1] == 2)
+    assert np.any(result.eligible_mask[:, 2])
+    assert not np.any(result.depth_continuous_mask[:, 2])
+    edge_queries = result.queries.parent_cell[:, 1] == 2
+    assert np.any(edge_queries)
+    assert not np.any(result.queries.source_cell_continuous[edge_queries])
     assert np.any(result.eligible_mask[:, :2])
 
 
@@ -152,3 +154,30 @@ def test_guided_sampler_is_deterministic_and_honors_budget() -> None:
     np.testing.assert_array_equal(first.queries.source_uv, second.queries.source_uv)
     np.testing.assert_array_equal(first.queries.ray_dir, second.queries.ray_dir)
     np.testing.assert_array_equal(first.added_density, second.added_density)
+
+
+def test_surface_bev_sampler_boosts_floor_like_outer_cells() -> None:
+    """flat floor처럼 연속적인 낮은 cell도 외곽이면 subdivision 후보가 되어야 한다."""
+
+    height = width = 21
+    rays = _anisotropic_rays(height, width, step_u=0.035, step_v=0.035)
+    result = generate_guided_observed_queries(
+        rays,
+        np.ones((height, width), dtype=bool),
+        np.ones((height, width), dtype=np.float32),
+        _identity_camera(width, height),
+        BevConfig(center_xy=(0.0, 0.0), size_m=100.0),
+        RaySamplerConfig(
+            target_surface_gap_m=0.06,
+            target_bev_gap_cells=100.0,
+            floor_edge_priority_weight=2.0,
+            max_added_queries_inference=500,
+        ),
+        mode="surface_bev",
+    )
+
+    density = result.added_density
+    center_mean = float(density[8:12, 8:12].mean())
+    outer = np.concatenate([density[:4].ravel(), density[-4:].ravel(), density[:, :4].ravel(), density[:, -4:].ravel()])
+    assert len(result.queries) > 0
+    assert float(outer.mean()) > center_mean

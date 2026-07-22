@@ -1,5 +1,5 @@
-"""부분 supervision loss 모음."""
+"""RGB-D quad completion 학습 손실."""
 
-from wide_fov_supervision_v2.loss.partial_loss import PartialLossMasks, PartialLossResult, PartialSupervisionLoss
+from wide_fov_supervision_v2.loss.completion_loss import CompletionLossResult, QuadCompletionLoss
 
-__all__ = ["PartialLossMasks", "PartialLossResult", "PartialSupervisionLoss"]
+__all__ = ["CompletionLossResult", "QuadCompletionLoss"]

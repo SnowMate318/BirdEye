@@ -1,26 +1,21 @@
 # wide_fov_supervision_v2
 
-어안 영상에서 ray 간격이 sparse해지는 영역을 보완하고, Depth Anything V2 / DSINE prior와 ray-aware refiner를 이용해 z-depth, normal, BEV 결과를 만드는 실험 코드입니다.
+어안 영상의 인접 `2×2` pixel ray가 넓게 벌어진 영역에 내부 query ray를 추가하고,
+네 corner RGB-D만으로 query의 RGB·z-depth·valid·confidence를 복원하는 실험 코드입니다.
 
-이 README는 실행 방법 중심으로 정리합니다. 데이터셋, checkpoint, cache, inference 결과는 `.gitignore`에 의해 저장소에 포함하지 않습니다.
+Ray 방향과 개수는 camera geometry와 adaptive sampler가 결정합니다. 학습 모델은 ray를
+생성하지 않고, 각 추가 ray의 RGB-D 속성만 예측합니다.
 
-## 1. 폴더 이동
+## 실행 환경
 
-PowerShell 기준으로 실행합니다.
+PowerShell에서 프로젝트 폴더와 가상환경을 활성화합니다.
 
 ```powershell
 cd C:\projects\isaac_sim_test\wide_fov_supervision_v2
-```
-
-## 2. 가상환경 준비
-
-이미 `.venv`가 있으면 활성화만 하면 됩니다.
-
-```powershell
 .\.venv\Scripts\Activate.ps1
 ```
 
-새로 만들 때는 Python 3.10 환경에서 다음처럼 설치합니다.
+가상환경이 없다면 Python 3.10으로 새로 만듭니다.
 
 ```powershell
 python -m venv .venv
@@ -29,276 +24,210 @@ python -m pip install --upgrade pip
 python -m pip install -r requirements.txt
 ```
 
-`requirements.txt`는 CUDA 12.8용 PyTorch 2.7.0을 기준으로 되어 있습니다.
-
-## 3. 실행 전 검증
-
-경로, checkpoint, fisheye ray round-trip을 빠르게 확인합니다.
+## 빠른 환경 검증
 
 ```powershell
 python run.py --mode validate
 ```
 
-정상이라면 `input_rgb_exists`, `depth_anything_vitl_ckpt_exists`, `dsine_ckpt_exists` 등이 `true`로 나옵니다.
-
-## 4. 기본 추론
-
-기본값은 DA-V2 기반 depth source를 사용합니다.
+Simulator z-depth 파일까지 함께 검사하려면:
 
 ```powershell
-python run.py --mode infer
-```
-
-결과는 timestamp 폴더에 저장됩니다.
-
-```text
-outputs/inference/YYYY_MM_DD_HH_MM_SS/
-```
-
-가장 먼저 열어볼 파일은 다음입니다.
-
-```text
-outputs/inference/YYYY_MM_DD_HH_MM_SS/index.html
-```
-
-## 5. 외부 depth_z.npy로 추론
-
-Isaac 등에서 만든 z-depth를 임시로 비교하고 싶을 때 사용합니다.
-
-```powershell
-python run.py --mode infer `
+python run.py --mode validate `
   --depth-source external_npy `
   --depth-npy compare/depth_z.npy
 ```
 
-`compare/`는 실험용 로컬 산출물이므로 Git에는 포함하지 않습니다.
+## NYU convex-quad cache 생성
 
-## 6. 빠른 디버그 추론
-
-direct branch를 끄고 tangent branch만 확인하려면:
-
-```powershell
-python run.py --mode infer `
-  --disable-direct
-```
-
-HTML 생성을 끄려면:
-
-```powershell
-python run.py --mode infer `
-  --disable-html
-```
-
-BEV 생성을 끄려면:
-
-```powershell
-python run.py --mode infer `
-  --disable-bev
-```
-
-dense BEV coverage 보완을 끄려면:
-
-```powershell
-python run.py --mode infer `
-  --disable-dense-coverage
-```
-
-dense source-cell subdivision을 바꾸려면:
-
-```powershell
-python run.py --mode infer `
-  --dense-subdivision 7
-```
-
-기본값은 `5`입니다. 값을 키우면 coverage는 늘 수 있지만 실행 시간이 길어집니다.
-
-## 7. NYU 학습 cache 생성
-
-정식 학습 전에는 teacher cache와 query sidecar cache가 필요합니다.
+학습 전에 frame별 convex quadrilateral 좌표 manifest를 만듭니다.
 
 ```powershell
 python run.py --mode cache
 ```
 
-이 단계는 다음을 수행합니다.
+Manifest에는 corner 좌표, 연속 표면 여부, support 3D edge gap만 저장합니다. RGB-D
+값은 복제하지 않고 학습 중 `nyu_depth_v2_labeled.mat`에서 직접 sampling합니다.
 
-```text
-NYU RGB-D 로드
-virtual fisheye 생성
-DA-V2 D0 생성
-DSINE N0 생성
-teacher cache 저장
-query sidecar 저장
+빠른 smoke cache는 다음처럼 실행합니다.
+
+```powershell
+python run.py --mode cache `
+  --max-train-items 1 `
+  --max-eval-items 1
 ```
 
-cache는 아래에 생성되며 Git에는 포함하지 않습니다.
-
-```text
-outputs/cache/
-```
-
-## 8. Refiner 학습
-
-cache 생성이 끝난 뒤 학습합니다.
+## 모델 학습
 
 ```powershell
 python run.py --mode train
 ```
 
-학습된 checkpoint는 다음 위치에 저장됩니다.
+Checkpoint는 아래에 저장됩니다.
 
 ```text
 outputs/train/YYYY_MM_DD_HH_MM_SS/checkpoints/last.pt
 ```
 
-짧은 smoke 학습만 돌리고 싶으면:
+1-frame, 1-epoch smoke 학습:
 
 ```powershell
 python run.py --mode train `
   --max-train-items 1 `
   --epochs 1 `
-  --batch-size 1
+  --batch-size 2
 ```
 
-정식 학습에서는 `--max-train-items`를 빼고 기본 설정을 사용합니다.
+새 모델은 이전 pose-conditioned Refiner checkpoint와 호환되지 않습니다. 잘못된
+checkpoint를 지정하면 schema 불일치 오류가 명시적으로 발생합니다.
 
-## 9. 학습 checkpoint로 추론
+## NYU 평가
 
-학습된 refiner를 inference에 반영하려면 `--checkpoint`를 명시해야 합니다.
+```powershell
+python run.py --mode evaluate `
+  --checkpoint outputs/train/YYYY_MM_DD_HH_MM_SS/checkpoints/last.pt
+```
+
+`metrics.json`에서 completion과 four-corner bilinear baseline의 RGB MAE/PSNR,
+depth AbsRel/RMSE, valid/confidence precision·recall을 같은 query 위치에서 비교합니다.
+
+## DA-V2 depth로 추론
 
 ```powershell
 python run.py --mode infer `
   --checkpoint outputs/train/YYYY_MM_DD_HH_MM_SS/checkpoints/last.pt
 ```
 
-checkpoint를 지정하지 않으면 refiner는 학습 파라미터를 로드하지 않습니다. 이 경우 결과는 주로 foundation model D0, analytic ray, adaptive/dense BEV postprocess에 의해 결정됩니다.
+기본값은 direct와 tangent backbone을 모두 실행하고 tangent D0를 adaptive query
+guidance와 최종 BEV의 support depth로 사용합니다.
 
-## 10. 전체 파이프라인 한 번에 실행
+## Simulator 또는 외부 z-depth로 추론
 
-cache, train, evaluate, infer를 모두 실행합니다.
+```powershell
+python run.py --mode infer `
+  --depth-source external_npy `
+  --depth-npy compare/depth_z.npy `
+  --checkpoint outputs/train/YYYY_MM_DD_HH_MM_SS/checkpoints/last.pt
+```
+
+`depth_z.npy`는 RGB와 같은 `(H,W)` shape의 source-camera z-depth이며 단위는 metre여야
+합니다. 외부 metric depth를 넣으면 completion 출력도 같은 metric scale을 따릅니다.
+
+빠른 query/BEV 연결 확인:
+
+```powershell
+python run.py --mode infer `
+  --depth-source external_npy `
+  --depth-npy compare/depth_z.npy `
+  --checkpoint outputs/train/YYYY_MM_DD_HH_MM_SS/checkpoints/last.pt `
+  --disable-tangent `
+  --max-queries 200
+```
+
+## 전체 실행
+
+`cache → train → evaluate → infer`를 순서대로 실행합니다.
 
 ```powershell
 python run.py --mode all
 ```
 
-시간이 오래 걸릴 수 있으므로 처음에는 `validate`, `cache`, `train`, `infer`를 단계별로 확인하는 것을 권장합니다.
+전체 NYU cache와 20 epoch 학습이 포함되므로 먼저 smoke 명령으로 환경을 확인하는 것이
+좋습니다.
 
-## 11. 주요 산출물 의미
-
-inference run 폴더에서 자주 보는 파일은 다음입니다.
+## 주요 옵션
 
 ```text
-source_rgb.png
-  입력 RGB입니다.
+--disable-direct       direct backbone 비활성화
+--disable-tangent      tangent backbone 비활성화
+--disable-completion   학습 모델 대신 bilinear depth/RGB baseline 사용
+--disable-bev          BEV 산출물 비활성화
+--disable-html         index.html 생성 비활성화
+--max-queries N        inference 추가 query 예산 제한
+--epochs N             학습 epoch override
+--batch-size N         학습/평가 batch size override
+```
 
-tangent/depth0_z.png
-  tangent branch에서 만든 source z-depth D0입니다.
+Stage별 기본 on/off와 threshold는 `config.py`의 `StageToggles`,
+`CompletionConfig`, `RaySamplerConfig`에서 바꿀 수 있습니다.
 
-tangent/normal0.png
-  DSINE 기반 source normal N0입니다.
+## 모델 입력과 출력
 
-added_ray_density.png
-  최종 추가 query ray 분포입니다.
+`modules/quad_completion/model.py`의 공개 인터페이스는 다음과 같습니다.
 
-adaptive_added_ray_density.png
-  Ray-aware Refiner에 들어간 adaptive query 분포입니다.
+```python
+result = model(
+    support_ray_dir,       # (B,4,3)
+    support_rgb,           # (B,4,3), 0..1
+    support_depth_z,       # (B,4)
+    support_valid,         # (B,4)
+    query_ray_dir,         # (B,Q,3)
+    query_relative_uv,     # (B,Q,2)
+    query_mask,            # (B,Q)
+)
+```
 
-dense_added_ray_density.png
-  BEV coverage 보완용 dense source-cell query 분포입니다.
+출력은 `rgb`, `depth_z`, `valid_logit`, `confidence_logit`,
+`delta_log_depth`입니다. 네 support의 valid median depth로 정규화하고 bilinear
+RGB/log-depth를 base로 사용하므로 공통 support scale에 대해 scale-equivariant합니다.
+단, DA-V2 자체의 잘못된 전역 scale을 새로 알아내는 모델은 아닙니다.
 
-bev_valid_before.png
-  추가 ray 적용 전 BEV support coverage입니다.
+## Inference 산출물
 
-bev_valid_after.png
-  추가 ray 적용 후 BEV support coverage입니다.
+결과는 `outputs/inference/YYYY_MM_DD_HH_MM_SS/`에 저장됩니다. 가장 먼저
+`index.html`을 열면 됩니다.
 
-newly_covered_bev_cells.png
-  추가 ray로 새롭게 채워진 BEV cell입니다.
+```text
+quad_completion_queries.npz
+query_rgb_pred.npy
+query_depth_pred_z.npy
+query_valid_probability.npy
+query_confidence_probability.npy
+source_cell_continuous.npy
 
-bev_rgb.png
-  최종 RGB BEV입니다.
+continuous_only/query_points_camera.npy
+continuous_only/query_points_world.npy
+continuous_only/bev_rgb.png
+continuous_only/bev_valid.png
+continuous_only/newly_covered_bev_cells.png
 
-observed_top_occupancy.png
-  관측된 top-facing non-floor surface입니다.
-  classic free/occupied grid가 아닙니다.
+edge_confident/query_points_camera.npy
+edge_confident/query_points_world.npy
+edge_confident/bev_rgb.png
+edge_confident/bev_valid.png
+edge_confident/newly_covered_bev_cells.png
 
-observed_support_occupancy.png
-  top-facing 여부와 무관하게 최종 ray가 관측/보완한 BEV support입니다.
-  coverage 변화를 직접 보고 싶을 때 이 파일을 확인합니다.
-
-top_probability_map.png
-  top-facing 판단 점수 지도입니다.
-
+quad_sampling_preview.png
+completion_rgb_preview.png
+completion_depth_preview.png
+confidence_map.png
 metrics.json
-  query 수, BEV coverage 변화, checkpoint 로드 여부 등 정량 지표입니다.
-
 metadata.json
-  실행 설정과 각 산출물 의미를 기록합니다.
-
 index.html
-  위 결과를 한국어 dashboard로 묶은 파일입니다.
 ```
 
-## 12. Git에 포함하지 않는 항목
+`continuous_only`는 depth-continuous source cell 중 valid/confidence threshold를 통과한
+query만 사용합니다. `edge_confident`는 모든 adaptive candidate를 대상으로 같은
+threshold를 적용하며 기본 최종 BEV입니다.
 
-다음은 `.gitignore`로 제외합니다.
+`observed_top_occupancy.png`의 검정색은 관측된 top-facing non-floor surface입니다.
+Classic free/occupied grid가 아니며 흰색에는 free, non-top, 미관측 상태가 함께 포함됩니다.
 
-```text
-.venv/
-outputs/
-compare/
-rgb.png
-data/
-dataset/
-datasets/**/raw/
-datasets/**/processed/
-checkpoints/
-weights/
-*.pt, *.pth, *.ckpt
-*.npy, *.npz
-*.mat, *.h5, *.hdf5
-```
-
-이미 Git에 추가된 대용량 파일은 `.gitignore`만으로 제거되지 않습니다. 파일은 유지하고 Git 추적만 끊으려면 다음처럼 실행합니다.
+## 테스트
 
 ```powershell
-git rm --cached -r outputs
-git rm --cached -r .venv
-git rm --cached -r compare
-git rm --cached rgb.png
+python -m pytest -q
 ```
 
-필요한 항목만 선택해서 실행하세요.
+Convex/self-intersection/Jacobian 검사, corner mapping, scale-equivariance, padding mask,
+confidence target, NaN-safe gradient, sampler 결정성, checkpoint schema를 검증합니다.
 
-## 13. GitHub push 예시
+## Git 제외 항목
 
-저장소가 아직 초기화되지 않았다면:
+`.gitignore`는 `.venv/`, `outputs/`, `compare/`, NYU 원본, checkpoint, `*.npy`,
+`*.npz`, point cloud 등 대용량 로컬 산출물을 제외합니다. Push 전에는 다음으로
+확인합니다.
 
 ```powershell
-git init
-git remote add origin https://github.com/SnowMate318/BirdEye.git
-git add .
-git commit -m "Add wide_fov_supervision_v2 pipeline"
-git branch -M main
-git push -u origin main
+git status --short
 ```
-
-이미 remote가 있다면:
-
-```powershell
-git add .
-git commit -m "Update wide_fov_supervision_v2 pipeline"
-git push
-```
-
-push 전에 `git status --short`로 `outputs/`, `.venv/`, `*.pt`, `*.npy`, `*.npz`가 올라가지 않는지 확인하세요.
-
-## 14. 테스트
-
-단위 테스트는 다음처럼 실행합니다.
-
-```powershell
-python -m pytest tests -q
-```
-
-프로젝트 root인 `wide_fov_supervision_v2` 안에서 실행하는 것을 기준으로 합니다.

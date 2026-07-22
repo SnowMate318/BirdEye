@@ -1,13 +1,12 @@
 from __future__ import annotations
 
-from pathlib import Path
 import gc
 import hashlib
 import json
+from pathlib import Path
 import shutil
 import time
 
-import cv2
 import numpy as np
 from PIL import Image
 import torch
@@ -21,8 +20,7 @@ from wide_fov_supervision_v2.modules.adaptive_ray import (
     RayQuerySet,
     generate_front_hemisphere_queries,
     generate_guided_observed_queries,
-    generate_source_queries,
-    merge_query_sets,
+    spherical_bilerp,
 )
 from wide_fov_supervision_v2.modules.bev_mapping import build_bev_outputs, build_bev_valid
 from wide_fov_supervision_v2.modules.camera_geometry import (
@@ -31,294 +29,76 @@ from wide_fov_supervision_v2.modules.camera_geometry import (
     cell_angular_gap,
     cv_rays_to_world,
     points_from_z_depth,
-    project_fisheye_rays,
 )
-from wide_fov_supervision_v2.modules.dense_coverage import build_dense_coverage_bev
-from wide_fov_supervision_v2.modules.query_geometry import normals_from_stencil_depths, query_stencil_rays, sample_at_uv
-from wide_fov_supervision_v2.modules.refiner import RayAwareQueryRefiner
+from wide_fov_supervision_v2.modules.quad_completion.model import QuadRayCompletionModel
+from wide_fov_supervision_v2.modules.query_geometry import dense_normals_from_depth, normals_from_stencil_depths
+from wide_fov_supervision_v2.modules.surface_rasterization import FloorSurfaceRasterResult, rasterize_floor_surfaces
 from wide_fov_supervision_v2.modules.visualization import save_coverage, save_depth, save_heatmap, save_mask, save_normal, save_rgb
 from wide_fov_supervision_v2.train.checkpoints import load_checkpoint
 
 
 def load_rgb(path: Path) -> np.ndarray:
-    """RGB PNG/JPG를 `uint8 (H,W,3)`로 읽는다."""
-
     return np.asarray(Image.open(path).convert("RGB"), dtype=np.uint8)
 
 
 def sha256_file(path: Path) -> str:
-    """파일 SHA256 hash를 계산한다."""
-
     digest = hashlib.sha256()
-    with path.open("rb") as f:
-        for chunk in iter(lambda: f.read(1024 * 1024), b""):
+    with path.open("rb") as stream:
+        for chunk in iter(lambda: stream.read(1024 * 1024), b""):
             digest.update(chunk)
     return digest.hexdigest()
 
 
 def create_run_dir(config: PipelineConfig, mode: str) -> Path:
-    """timestamp run directory를 만든다."""
-
     root = config.paths.outputs / ("inference" if mode == "infer" else mode)
     run_dir = root / time.strftime("%Y_%m_%d_%H_%M_%S")
     run_dir.mkdir(parents=True, exist_ok=True)
     return run_dir
 
 
-def _save_prediction(run_dir: Path, pred: BackbonePrediction) -> None:
-    branch_dir = run_dir / pred.branch
+def _save_prediction(run_dir: Path, prediction: BackbonePrediction) -> None:
+    branch_dir = run_dir / prediction.branch
     branch_dir.mkdir(parents=True, exist_ok=True)
-    np.save(branch_dir / "depth0_z.npy", pred.depth0_z.astype(np.float32))
-    np.save(branch_dir / "normal0.npy", pred.normal0.astype(np.float32))
-    np.save(branch_dir / "valid.npy", pred.valid.astype(bool))
-    save_depth(branch_dir / "depth0_z.png", pred.depth0_z)
-    save_normal(branch_dir / "normal0.png", pred.normal0)
+    np.save(branch_dir / "depth0_z.npy", prediction.depth0_z.astype(np.float32))
+    np.save(branch_dir / "normal0.npy", prediction.normal0.astype(np.float32))
+    np.save(branch_dir / "valid.npy", prediction.valid.astype(bool))
+    save_depth(branch_dir / "depth0_z.png", prediction.depth0_z)
+    save_normal(branch_dir / "normal0.png", prediction.normal0)
 
 
-def _prediction_to_tensors(pred: BackbonePrediction, rgb: np.ndarray, source_rays: np.ndarray, lens_valid: np.ndarray, device: torch.device) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-    source_rgb = torch.from_numpy(rgb.astype(np.float32) / 255.0).permute(2, 0, 1).unsqueeze(0).to(device)
-    source_depth0 = torch.from_numpy(np.nan_to_num(pred.depth0_z.astype(np.float32), nan=0.0, posinf=0.0, neginf=0.0)).unsqueeze(0).unsqueeze(0).to(device)
-    source_normal0 = torch.from_numpy(np.nan_to_num(pred.normal0.astype(np.float32))).permute(2, 0, 1).unsqueeze(0).to(device)
-    source_rays_t = torch.from_numpy(source_rays.astype(np.float32)).permute(2, 0, 1).unsqueeze(0).to(device)
-    valid = lens_valid & pred.valid & np.isfinite(pred.depth0_z) & (pred.depth0_z > 0.0) & np.isfinite(pred.normal0).all(axis=-1)
-    source_valid = torch.from_numpy(valid.astype(np.float32)).unsqueeze(0).unsqueeze(0).to(device)
-    return source_rgb, source_depth0, source_normal0, source_rays_t, source_valid
+def _select_final_query_depth(
+    model_depth_z: np.ndarray,
+    base_depth_z: np.ndarray,
+    source_cell_continuous: np.ndarray,
+    *,
+    use_base_for_continuous: bool,
+) -> tuple[np.ndarray, np.ndarray]:
+    """최종 query z-depth를 선택한다.
 
+    Convex-quad completion 모델은 ``D = base * exp(delta)`` 형태로 residual을
+    예측한다. 랙/물체 경계처럼 source 2x2 corner가 불연속인 cell에서는 이 residual이
+    필요하지만, 바닥처럼 네 corner가 이미 같은 연속 표면을 보는 cell에서는 residual이
+    오히려 metric depth를 밀어 BEV 바닥 coverage를 깨뜨릴 수 있다.
 
-def _query_tensors(query: RayQuerySet, sl: slice, device: torch.device) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-    q = query.subset(np.arange(len(query))[sl])
-    rays = torch.from_numpy(q.ray_dir.astype(np.float32)).unsqueeze(0).to(device)
-    uv = torch.from_numpy(q.source_uv.astype(np.float32)).unsqueeze(0).to(device)
-    rel = torch.from_numpy(np.nan_to_num(q.relative_uv.astype(np.float32))).unsqueeze(0).to(device)
-    sampling = torch.from_numpy(np.nan_to_num(q.sampling_features.astype(np.float32))).unsqueeze(0).to(device)
-    obs = torch.from_numpy(q.observed.astype(np.float32)).unsqueeze(0).to(device)
-    return rays, uv, rel, sampling, obs
+    따라서 ``source_cell_continuous``인 query는 유효한 bilinear ``base_depth_z``를
+    최종 depth로 사용하고, 나머지 edge/discontinuous query만 모델 depth를 사용한다.
+    반환되는 bool mask는 실제로 base depth가 적용된 query 위치다.
+    """
 
-
-def run_refiner_on_queries(
-    config: PipelineConfig,
-    pred: BackbonePrediction,
-    rgb: np.ndarray,
-    source_rays: np.ndarray,
-    lens_valid: np.ndarray,
-    queries: RayQuerySet,
-) -> dict[str, np.ndarray]:
-    """query set 전체를 chunk 단위로 refiner에 통과시킨다."""
-
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    model = RayAwareQueryRefiner(config.refiner).to(device).eval() if config.toggles.enable_refiner else None
-    if model is not None and config.paths.checkpoint is not None and Path(config.paths.checkpoint).exists():
-        load_checkpoint(Path(config.paths.checkpoint), model, map_location=device)
-    source = _prediction_to_tensors(pred, rgb, source_rays, lens_valid, device)
-    depth_final = np.full((len(queries),), np.nan, dtype=np.float32)
-    depth0_query = np.full((len(queries),), np.nan, dtype=np.float32)
-    delta = np.zeros((len(queries),), dtype=np.float32)
-    normal_final = np.full((len(queries), 3), np.nan, dtype=np.float32)
-    source_valid_query = np.zeros((len(queries),), dtype=bool)
-    chunk = int(config.ray.query_chunk_size)
-    with torch.inference_mode():
-        source_features = model.encode_source(*source) if model is not None else None
-        for start in range(0, len(queries), chunk):
-            stop = min(start + chunk, len(queries))
-            q_rays, q_uv, q_rel, q_sampling, q_obs = _query_tensors(queries, slice(start, stop), device)
-            if model is not None:
-                center = model.decode_queries(
-                    source[1], source[2], source[3], source[4], source_features,
-                    q_rays, q_uv, q_rel, q_sampling, q_obs,
-                )
-            else:
-                d0_query = sample_at_uv(source[1], q_uv).squeeze(-1)
-                valid_query = sample_at_uv(source[4], q_uv).squeeze(-1)
-                normal0_query = torch.nn.functional.normalize(sample_at_uv(source[2], q_uv), dim=-1)
-                source_ray_query = torch.nn.functional.normalize(sample_at_uv(source[3], q_uv), dim=-1)
-                finite = torch.isfinite(d0_query) & (d0_query > 0.0) & (valid_query > 0.5)
-                center = {
-                    "depth_final_z": torch.where(finite, d0_query, torch.full_like(d0_query, float("nan"))),
-                    "delta_log_depth": torch.zeros_like(d0_query),
-                    "depth0_query_z": d0_query,
-                    "normal0_query": normal0_query,
-                    "source_ray_query": source_ray_query,
-                    "source_valid_query": valid_query,
-                }
-            stencil_rays = query_stencil_rays(q_rays, config.ray.stencil_step_rad)
-            flat_stencil = stencil_rays.reshape(1, -1, 3)
-            uv_np, uv_valid_np = project_fisheye_rays(flat_stencil.cpu().numpy()[0], config.camera)
-            s_uv = torch.from_numpy(uv_np.astype(np.float32)).unsqueeze(0).to(device)
-            s_valid = torch.from_numpy(uv_valid_np.astype(np.float32)).unsqueeze(0).to(device)
-            s_rel = q_rel.repeat_interleave(4, dim=1)
-            s_sampling = q_sampling.repeat_interleave(4, dim=1)
-            s_obs = q_obs.repeat_interleave(4, dim=1) * s_valid
-            if model is not None:
-                stencil = model.decode_queries(
-                    source[1], source[2], source[3], source[4], source_features,
-                    flat_stencil, s_uv, s_rel, s_sampling, s_obs,
-                )
-                stencil_depth = stencil["depth_final_z"].reshape(1, -1, 4)
-                stencil_source_valid = stencil["source_valid_query"].reshape(1, -1, 4) > 0.5
-            else:
-                stencil_depth = sample_at_uv(source[1], s_uv).squeeze(-1).reshape(1, -1, 4)
-                stencil_source_valid = sample_at_uv(source[4], s_uv).squeeze(-1).reshape(1, -1, 4) > 0.5
-            n_star, n_valid = normals_from_stencil_depths(center["depth_final_z"], stencil_depth, q_rays, stencil_rays, z_eps=config.camera.geometry_z_eps)
-            all_depth = torch.cat([center["depth_final_z"].unsqueeze(-1), stencil_depth], dim=-1)
-            finite_depth = torch.isfinite(all_depth).all(dim=-1) & (all_depth > 0.0).all(dim=-1)
-            safe_log = torch.log(torch.nan_to_num(all_depth, nan=1.0, posinf=1.0, neginf=1.0).clamp_min(1.0e-4))
-            continuous = (
-                safe_log.amax(dim=-1) - safe_log.amin(dim=-1)
-                <= float(config.loss.depth_discontinuity_log_threshold)
-            )
-            n_valid &= stencil_source_valid.all(dim=-1) & finite_depth & continuous
-            depth_final[start:stop] = center["depth_final_z"][0].detach().cpu().numpy().astype(np.float32)
-            depth0_query[start:stop] = center["depth0_query_z"][0].detach().cpu().numpy().astype(np.float32)
-            delta[start:stop] = center["delta_log_depth"][0].detach().cpu().numpy().astype(np.float32)
-            nf = n_star[0].detach().cpu().numpy().astype(np.float32)
-            nf[~n_valid[0].detach().cpu().numpy()] = np.nan
-            normal_final[start:stop] = nf
-            source_valid_query[start:stop] = (center["source_valid_query"][0].detach().cpu().numpy() > 0.5)
-    depth_final[queries.unknown] = np.nan
-    depth0_query[queries.unknown] = np.nan
-    normal_final[queries.unknown] = np.nan
-    return {
-        "depth_final_z": depth_final,
-        "depth0_query_z": depth0_query,
-        "delta_log_depth": delta,
-        "normal_final": normal_final,
-        "source_valid_query": source_valid_query,
-    }
-
-
-def _sample_query_rgb(rgb: np.ndarray, queries: RayQuerySet) -> np.ndarray:
-    uv = queries.source_uv.astype(np.float32)
-    colors = np.zeros((len(queries), 3), dtype=np.uint8)
-    # OpenCV remap은 dst width/height가 SHRT_MAX보다 작아야 하므로 query를
-    # 1xQ strip으로 한 번에 보내지 않고 안전한 chunk로 나눠 sampling한다.
-    chunk = 30_000
-    for start in range(0, len(queries), chunk):
-        stop = min(start + chunk, len(queries))
-        map_x = (uv[start:stop, 0] - 0.5).reshape(1, -1)
-        map_y = (uv[start:stop, 1] - 0.5).reshape(1, -1)
-        colors[start:stop] = cv2.remap(
-            rgb,
-            map_x,
-            map_y,
-            interpolation=cv2.INTER_LINEAR,
-            borderMode=cv2.BORDER_CONSTANT,
-            borderValue=0,
-        )[0]
-    colors[queries.unknown] = 0
-    return colors.astype(np.uint8)
-
-
-def _sample_query_map(value: np.ndarray, queries: RayQuerySet) -> np.ndarray:
-    """dense scalar map을 query의 source_uv에서 bilinear sampling한다."""
-
-    uv = queries.source_uv.astype(np.float32)
-    sampled = np.full((len(queries),), np.nan, dtype=np.float32)
-    chunk = 30_000
-    source = np.asarray(value, dtype=np.float32)
-    for start in range(0, len(queries), chunk):
-        stop = min(start + chunk, len(queries))
-        map_x = (uv[start:stop, 0] - 0.5).reshape(1, -1)
-        map_y = (uv[start:stop, 1] - 0.5).reshape(1, -1)
-        sampled[start:stop] = cv2.remap(
-            source,
-            map_x,
-            map_y,
-            interpolation=cv2.INTER_LINEAR,
-            borderMode=cv2.BORDER_CONSTANT,
-            borderValue=float("nan"),
-        )[0]
-    sampled[queries.unknown] = np.nan
-    return sampled
-
-
-def _query_depth_metrics(prefix: str, prediction: np.ndarray, target: np.ndarray, mask: np.ndarray) -> dict[str, float | int]:
-    """동일 query 위치에서 z-depth AbsRel/RMSE를 계산한다."""
-
-    valid = (
-        np.asarray(mask, dtype=bool)
-        & np.isfinite(prediction)
-        & np.isfinite(target)
-        & (prediction > 0.0)
-        & (target > 0.0)
+    final_depth = np.asarray(model_depth_z, dtype=np.float32).copy()
+    if not use_base_for_continuous:
+        return final_depth, np.zeros(final_depth.shape, dtype=bool)
+    base_depth = np.asarray(base_depth_z, dtype=np.float32)
+    base_mask = (
+        np.asarray(source_cell_continuous, dtype=bool)
+        & np.isfinite(base_depth)
+        & (base_depth > 0.0)
     )
-    if not np.any(valid):
-        return {f"{prefix}_valid": 0}
-    pred = prediction[valid].astype(np.float64)
-    gt = target[valid].astype(np.float64)
-    return {
-        f"{prefix}_valid": int(valid.sum()),
-        f"{prefix}_absrel": float(np.mean(np.abs(pred - gt) / np.clip(gt, 1.0e-6, None))),
-        f"{prefix}_rmse": float(np.sqrt(np.mean((pred - gt) ** 2))),
-    }
-
-
-def _query_points(config: PipelineConfig, queries: RayQuerySet, depth_z: np.ndarray) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
-    camera_points, radial, valid = points_from_z_depth(depth_z, queries.ray_dir, z_eps=config.camera.geometry_z_eps)
-    valid &= queries.observed & ~queries.unknown
-    world_points = camera_to_world_points(camera_points, config.camera).astype(np.float32)
-    world_points[~valid] = np.nan
-    camera_points[~valid] = np.nan
-    return camera_points, world_points, radial, valid
-
-
-def _normals_to_world(normals_cv: np.ndarray, config: PipelineConfig) -> np.ndarray:
-    out = cv_rays_to_world(normals_cv, np.asarray(config.camera.world_from_camera, dtype=np.float64))
-    norm = np.linalg.norm(out, axis=-1, keepdims=True)
-    out = out / np.clip(norm, 1.0e-6, None)
-    out[~np.isfinite(norm[..., 0])] = np.nan
-    return out.astype(np.float32)
-
-
-def _load_matching_isaac_gt(config: PipelineConfig, rgb_hash: str) -> dict[str, np.ndarray] | None:
-    if not config.toggles.enable_gt_evaluation:
-        return None
-    if config.eval.use_isaac_gt_only_on_hash_match and rgb_hash.lower() != config.eval.input_rgb_sha256.lower():
-        return None
-    ref = config.paths.isaac_reference_run
-    depth_path = ref / "depth_z.npy"
-    if not depth_path.exists():
-        return None
-    return {"depth_z": np.load(depth_path).astype(np.float32)}
-
-
-def _error_maps(pred_depth: np.ndarray, gt_depth: np.ndarray, valid: np.ndarray) -> tuple[np.ndarray, dict]:
-    mask = valid & np.isfinite(pred_depth) & np.isfinite(gt_depth) & (pred_depth > 0.0) & (gt_depth > 0.0)
-    err = np.full_like(pred_depth, np.nan, dtype=np.float32)
-    err[mask] = np.abs(pred_depth[mask] - gt_depth[mask]) / np.clip(gt_depth[mask], 1.0e-6, None)
-    metrics = {"gt_valid": int(mask.sum())}
-    if np.any(mask):
-        metrics.update(
-            {
-                "gt_absrel": float(np.mean(err[mask])),
-                "gt_rmse": float(np.sqrt(np.mean((pred_depth[mask] - gt_depth[mask]) ** 2))),
-            }
-        )
-    return err, metrics
-
-
-def _finite_stats(prefix: str, values: np.ndarray, mask: np.ndarray | None = None) -> dict[str, float | int]:
-    """유효한 spacing 값의 percentile을 JSON용 scalar로 요약한다."""
-
-    valid = np.isfinite(values)
-    if mask is not None:
-        valid &= np.asarray(mask, dtype=bool)
-    samples = np.asarray(values, dtype=np.float64)[valid]
-    if len(samples) == 0:
-        return {f"{prefix}_count": 0}
-    quantiles = np.percentile(samples, [50.0, 90.0, 95.0, 99.0])
-    return {
-        f"{prefix}_count": int(len(samples)),
-        f"{prefix}_p50": float(quantiles[0]),
-        f"{prefix}_p90": float(quantiles[1]),
-        f"{prefix}_p95": float(quantiles[2]),
-        f"{prefix}_p99": float(quantiles[3]),
-        f"{prefix}_max": float(np.max(samples)),
-    }
+    final_depth[base_mask] = base_depth[base_mask]
+    return final_depth, base_mask
 
 
 def _save_adaptive_diagnostics(run_dir: Path, result: AdaptiveRayResult) -> None:
-    """guided sampler의 원본 수치 map과 비교 가능한 PNG를 함께 저장한다."""
-
     arrays = {
         "ray_gap_before": result.angular_gap_before,
         "ray_gap_after": result.angular_gap_planned_after,
@@ -327,48 +107,472 @@ def _save_adaptive_diagnostics(run_dir: Path, result: AdaptiveRayResult) -> None
         "bev_gap_before_cells": result.bev_gap_before_cells,
         "bev_gap_planned_after_cells": result.bev_gap_planned_after_cells,
         "sampling_priority": result.sampling_priority,
-        "planned_added_ray_density": result.added_density,
+        "added_ray_density": result.added_density,
     }
     for name, array in arrays.items():
         np.save(run_dir / f"{name}.npy", np.asarray(array))
-
-    # before/after 쌍은 같은 color scale을 사용해야 색만 보고 실제 감소량을 비교할 수 있다.
     for before_name, after_name in (
         ("ray_gap_before", "ray_gap_after"),
         ("surface_gap_before_m", "surface_gap_planned_after_m"),
         ("bev_gap_before_cells", "bev_gap_planned_after_cells"),
     ):
-        before = arrays[before_name]
-        finite = before[np.isfinite(before)]
-        high = float(np.percentile(finite, 99.0)) if len(finite) else 1.0
-        save_heatmap(run_dir / f"{before_name}.png", before, value_min=0.0, value_max=max(high, 1.0e-8))
-        save_heatmap(run_dir / f"{after_name}.png", arrays[after_name], value_min=0.0, value_max=max(high, 1.0e-8))
-
+        finite = arrays[before_name][np.isfinite(arrays[before_name])]
+        maximum = float(np.percentile(finite, 99.0)) if len(finite) else 1.0
+        save_heatmap(run_dir / f"{before_name}.png", arrays[before_name], value_min=0.0, value_max=maximum)
+        save_heatmap(run_dir / f"{after_name}.png", arrays[after_name], value_min=0.0, value_max=maximum)
     save_heatmap(run_dir / "sampling_priority.png", result.sampling_priority)
-    save_heatmap(run_dir / "planned_added_ray_density.png", result.added_density)
+    save_heatmap(run_dir / "added_ray_density.png", result.added_density)
     save_mask(run_dir / "sampling_eligible.png", result.eligible_mask)
-    np.save(run_dir / "sampling_eligible.npy", result.eligible_mask.astype(bool))
+    np.save(run_dir / "sampling_eligible.npy", result.eligible_mask)
 
 
-def _density_region_metrics(density: np.ndarray) -> dict[str, float]:
-    """영상 중심과 외곽의 added-query density를 같은 cell 면적으로 비교한다."""
+def _query_support(
+    queries: RayQuerySet,
+    rgb: np.ndarray,
+    depth_z: np.ndarray,
+    rays: np.ndarray,
+    source_valid: np.ndarray,
+    indices: np.ndarray,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+    """각 query parent cell의 실제 2x2 fisheye support를 고정 순서로 꺼낸다."""
 
-    height, width = density.shape
-    yy, xx = np.mgrid[:height, :width]
-    nx = (xx - (width - 1) * 0.5) / max(width * 0.5, 1.0)
-    ny = (yy - (height - 1) * 0.5) / max(height * 0.5, 1.0)
-    radius = np.sqrt(nx * nx + ny * ny)
-    center = radius < 0.25
-    outer = (radius >= 0.75) & (radius < 1.0)
+    parent = queries.parent_cell[indices]
+    y, x = parent[:, 0], parent[:, 1]
+    support_rgb = np.stack([rgb[y, x], rgb[y, x + 1], rgb[y + 1, x + 1], rgb[y + 1, x]], axis=1)
+    support_depth = np.stack(
+        [depth_z[y, x], depth_z[y, x + 1], depth_z[y + 1, x + 1], depth_z[y + 1, x]], axis=1
+    )
+    support_rays = np.stack(
+        [rays[y, x], rays[y, x + 1], rays[y + 1, x + 1], rays[y + 1, x]], axis=1
+    )
+    support_valid = np.stack(
+        [source_valid[y, x], source_valid[y, x + 1], source_valid[y + 1, x + 1], source_valid[y + 1, x]],
+        axis=1,
+    )
+    return (
+        support_rays.astype(np.float32),
+        support_rgb.astype(np.float32) / 255.0,
+        support_depth.astype(np.float32),
+        support_valid.astype(bool),
+    )
+
+
+def _stencil_rays_from_parent(queries: RayQuerySet, source_rays: np.ndarray, indices: np.ndarray, step: float) -> tuple[np.ndarray, np.ndarray]:
+    parent = queries.parent_cell[indices]
+    y, x = parent[:, 0], parent[:, 1]
+    rel = queries.relative_uv[indices]
+    offsets = np.array([[-step, 0.0], [step, 0.0], [0.0, -step], [0.0, step]], dtype=np.float32)
+    stencil_rel = np.clip(rel[:, None, :] + offsets[None], 0.0, 1.0)
+    r00, r10 = source_rays[y, x], source_rays[y, x + 1]
+    r11, r01 = source_rays[y + 1, x + 1], source_rays[y + 1, x]
+    stencil_rays = spherical_bilerp(
+        r00[:, None],
+        r10[:, None],
+        r01[:, None],
+        r11[:, None],
+        stencil_rel[..., 0],
+        stencil_rel[..., 1],
+    )
+    return stencil_rays.astype(np.float32), stencil_rel.astype(np.float32)
+
+
+def run_completion_on_queries(
+    config: PipelineConfig,
+    prediction: BackbonePrediction,
+    rgb: np.ndarray,
+    source_rays: np.ndarray,
+    lens_valid: np.ndarray,
+    queries: RayQuerySet,
+) -> dict[str, np.ndarray | bool]:
+    """각 adaptive query를 parent cell의 네 support만 사용해 단일 pass로 복원한다."""
+
+    count = len(queries)
+    output = {
+        "rgb": np.zeros((count, 3), dtype=np.float32),
+        "depth_z": np.full(count, np.nan, dtype=np.float32),
+        "model_depth_z": np.full(count, np.nan, dtype=np.float32),
+        "base_rgb": np.zeros((count, 3), dtype=np.float32),
+        "base_depth_z": np.full(count, np.nan, dtype=np.float32),
+        "base_depth_applied": np.zeros(count, dtype=bool),
+        "valid_probability": np.zeros(count, dtype=np.float32),
+        "confidence_probability": np.zeros(count, dtype=np.float32),
+        "delta_log_depth": np.zeros(count, dtype=np.float32),
+        "normal": np.full((count, 3), np.nan, dtype=np.float32),
+    }
+    if count == 0:
+        output["checkpoint_loaded"] = False
+        return output
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    model = QuadRayCompletionModel(config.completion).to(device).eval()
+    checkpoint_loaded = False
+    if config.toggles.enable_completion and config.paths.checkpoint is not None:
+        checkpoint_path = Path(config.paths.checkpoint)
+        if not checkpoint_path.exists():
+            raise FileNotFoundError(f"Completion checkpoint가 없습니다: {checkpoint_path}")
+        load_checkpoint(checkpoint_path, model, map_location=device)
+        checkpoint_loaded = True
+    # DSINE normal 유효성은 completion 입력이나 query 선택에 사용하지 않는다.
+    source_valid = lens_valid & np.isfinite(prediction.depth0_z) & (prediction.depth0_z > 0.0)
+    batch_size = min(4096, max(1, int(config.ray.query_chunk_size)))
+    with torch.inference_mode():
+        for start in range(0, count, batch_size):
+            stop = min(start + batch_size, count)
+            indices = np.arange(start, stop)
+            support_rays, support_rgb, support_depth, support_valid = _query_support(
+                queries, rgb, prediction.depth0_z, source_rays, source_valid, indices
+            )
+            stencil_rays, stencil_rel = _stencil_rays_from_parent(
+                queries, source_rays, indices, config.ray.normal_stencil_relative_step
+            )
+            to_tensor = lambda value: torch.from_numpy(value).to(device)
+            support_rays_t = to_tensor(support_rays)
+            support_rgb_t = to_tensor(support_rgb)
+            support_depth_t = to_tensor(support_depth)
+            support_valid_t = to_tensor(support_valid)
+            query_rays_t = to_tensor(queries.ray_dir[indices, None].astype(np.float32))
+            query_rel_t = to_tensor(queries.relative_uv[indices, None].astype(np.float32))
+            query_mask_t = torch.ones((len(indices), 1), dtype=torch.bool, device=device)
+            center = model(
+                support_rays_t,
+                support_rgb_t,
+                support_depth_t,
+                support_valid_t,
+                query_rays_t,
+                query_rel_t,
+                query_mask_t,
+            )
+            stencil = model(
+                support_rays_t,
+                support_rgb_t,
+                support_depth_t,
+                support_valid_t,
+                to_tensor(stencil_rays),
+                to_tensor(stencil_rel),
+                torch.ones((len(indices), 4), dtype=torch.bool, device=device),
+            )
+            continuous_t = torch.from_numpy(queries.source_cell_continuous[indices]).to(device=device)
+            center_model_depth = center.depth_z[:, 0]
+            center_base_depth = center.base_depth_z[:, 0]
+            stencil_model_depth = stencil.depth_z
+            stencil_base_depth = stencil.base_depth_z
+            if config.completion.use_base_depth_for_continuous_queries:
+                center_base_valid = torch.isfinite(center_base_depth) & (center_base_depth > 0.0)
+                stencil_base_valid = torch.isfinite(stencil_base_depth).all(dim=-1) & (stencil_base_depth > 0.0).all(dim=-1)
+                base_depth_t = continuous_t & center_base_valid & stencil_base_valid
+                center_depth = torch.where(base_depth_t, center_base_depth, center_model_depth)
+                stencil_depth = torch.where(base_depth_t[:, None], stencil_base_depth, stencil_model_depth)
+            else:
+                base_depth_t = torch.zeros_like(continuous_t, dtype=torch.bool)
+                center_depth = center_model_depth
+                stencil_depth = stencil_model_depth
+            normal, normal_valid = normals_from_stencil_depths(
+                center_depth[:, None],
+                stencil_depth[:, None, :],
+                query_rays_t,
+                to_tensor(stencil_rays[:, None]),
+                z_eps=config.camera.geometry_z_eps,
+            )
+            output["rgb"][indices] = center.rgb[:, 0].cpu().numpy()
+            output["depth_z"][indices] = center_depth.cpu().numpy()
+            output["model_depth_z"][indices] = center_model_depth.cpu().numpy()
+            output["base_rgb"][indices] = center.base_rgb[:, 0].cpu().numpy()
+            output["base_depth_z"][indices] = center.base_depth_z[:, 0].cpu().numpy()
+            output["base_depth_applied"][indices] = base_depth_t.cpu().numpy()
+            output["delta_log_depth"][indices] = center.delta_log_depth[:, 0].cpu().numpy()
+            if checkpoint_loaded:
+                output["valid_probability"][indices] = torch.sigmoid(center.valid_logit[:, 0]).cpu().numpy()
+                output["confidence_probability"][indices] = torch.sigmoid(center.confidence_logit[:, 0]).cpu().numpy()
+            else:
+                # 학습 전 baseline은 valid 2x2 cell을 허용하되 edge confidence는 보수적으로 둔다.
+                output["valid_probability"][indices] = support_valid.all(axis=1).astype(np.float32)
+                output["confidence_probability"][indices] = queries.source_cell_continuous[indices].astype(np.float32)
+            normal_np = normal[:, 0].cpu().numpy().astype(np.float32)
+            normal_np[~normal_valid[:, 0].cpu().numpy()] = np.nan
+            output["normal"][indices] = normal_np
+    output["checkpoint_loaded"] = checkpoint_loaded
+    return output
+
+
+def _dense_source_geometry(
+    config: PipelineConfig,
+    prediction: BackbonePrediction,
+    rgb: np.ndarray,
+    rays: np.ndarray,
+    lens_valid: np.ndarray,
+) -> dict[str, np.ndarray]:
+    valid = lens_valid & np.isfinite(prediction.depth0_z) & (prediction.depth0_z > 0.0)
+    camera_points, _, point_valid = points_from_z_depth(
+        prediction.depth0_z, rays, z_eps=config.camera.geometry_z_eps
+    )
+    valid &= point_valid
+    world_points = camera_to_world_points(camera_points, config.camera).astype(np.float32)
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    with torch.inference_mode():
+        depth_t = torch.from_numpy(np.nan_to_num(prediction.depth0_z).astype(np.float32))[None, None].to(device)
+        rays_t = torch.from_numpy(rays.astype(np.float32)).permute(2, 0, 1)[None].to(device)
+        valid_t = torch.from_numpy(valid)[None, None].to(device)
+        normal_t, normal_valid_t = dense_normals_from_depth(
+            depth_t, rays_t, valid_t, z_eps=config.camera.geometry_z_eps
+        )
+    normal = normal_t[0].permute(1, 2, 0).cpu().numpy().astype(np.float32)
+    normal_valid = normal_valid_t[0, 0].cpu().numpy()
     return {
-        "added_density_center_mean": float(np.mean(density[center])) if np.any(center) else 0.0,
-        "added_density_outer_mean": float(np.mean(density[outer])) if np.any(outer) else 0.0,
+        "camera_points": camera_points,
+        "world_points": world_points,
+        "rgb": rgb,
+        "normal": normal,
+        "valid": valid,
+        "normal_valid": normal_valid,
     }
 
 
-def validate_environment(config: PipelineConfig | None = None) -> dict:
-    """경로, split, projection round-trip을 빠르게 검증한다."""
+def _normals_to_world(normals_cv: np.ndarray, config: PipelineConfig) -> np.ndarray:
+    world = cv_rays_to_world(normals_cv, np.asarray(config.camera.world_from_camera, dtype=np.float64))
+    norm = np.linalg.norm(world, axis=-1, keepdims=True)
+    world = world / np.clip(norm, 1.0e-6, None)
+    world[~np.isfinite(norm[..., 0])] = np.nan
+    return world.astype(np.float32)
 
+
+def _query_geometry(config: PipelineConfig, queries: RayQuerySet, depth_z: np.ndarray) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    camera_points, _, valid = points_from_z_depth(depth_z, queries.ray_dir, z_eps=config.camera.geometry_z_eps)
+    valid &= queries.observed & ~queries.unknown
+    world_points = camera_to_world_points(camera_points, config.camera).astype(np.float32)
+    camera_points[~valid] = np.nan
+    world_points[~valid] = np.nan
+    return camera_points, world_points, valid
+
+
+def _save_completion_previews(
+    run_dir: Path,
+    rgb: np.ndarray,
+    queries: RayQuerySet,
+    completion: dict[str, np.ndarray | bool],
+) -> None:
+    h, w = rgb.shape[:2]
+    xy = np.rint(queries.source_uv - 0.5).astype(np.int64)
+    inside = (xy[:, 0] >= 0) & (xy[:, 0] < w) & (xy[:, 1] >= 0) & (xy[:, 1] < h)
+    sampling = rgb.copy()
+    continuous = queries.source_cell_continuous & inside
+    edge = ~queries.source_cell_continuous & inside
+    sampling[xy[continuous, 1], xy[continuous, 0]] = np.array([30, 220, 80], dtype=np.uint8)
+    sampling[xy[edge, 1], xy[edge, 0]] = np.array([240, 70, 60], dtype=np.uint8)
+    save_rgb(run_dir / "quad_sampling_preview.png", sampling)
+
+    rgb_preview = np.zeros_like(rgb)
+    pred_rgb = np.clip(np.asarray(completion["rgb"]) * 255.0, 0.0, 255.0).astype(np.uint8)
+    rgb_preview[xy[inside, 1], xy[inside, 0]] = pred_rgb[inside]
+    save_rgb(run_dir / "completion_rgb_preview.png", rgb_preview)
+    depth_preview = np.full((h, w), np.nan, dtype=np.float32)
+    confidence_map = np.full((h, w), np.nan, dtype=np.float32)
+    depth_preview[xy[inside, 1], xy[inside, 0]] = np.asarray(completion["depth_z"])[inside]
+    confidence_map[xy[inside, 1], xy[inside, 0]] = np.asarray(completion["confidence_probability"])[inside]
+    save_depth(run_dir / "completion_depth_preview.png", depth_preview)
+    save_heatmap(run_dir / "confidence_map.png", confidence_map, value_min=0.0, value_max=1.0)
+
+
+def _save_bev_branch(
+    run_dir: Path,
+    name: str,
+    config: PipelineConfig,
+    source: dict[str, np.ndarray],
+    query_camera: np.ndarray,
+    query_world: np.ndarray,
+    query_rgb: np.ndarray,
+    query_normal_cv: np.ndarray,
+    query_mask: np.ndarray,
+    bev_valid_before: np.ndarray,
+    floor_surface: FloorSurfaceRasterResult | None,
+) -> dict[str, int]:
+    branch_dir = run_dir / name
+    branch_dir.mkdir(parents=True, exist_ok=True)
+    query_valid = query_mask & np.isfinite(query_world).all(axis=-1)
+    np.save(branch_dir / "query_points_camera.npy", query_camera[query_valid].astype(np.float32))
+    np.save(branch_dir / "query_points_world.npy", query_world[query_valid].astype(np.float32))
+    np.save(branch_dir / "query_points_rgb.npy", query_rgb[query_valid].astype(np.uint8))
+
+    source_valid = source["valid"]
+    source_world = source["world_points"][source_valid]
+    source_rgb = source["rgb"][source_valid]
+    source_normal_cv = source["normal"][source_valid]
+    world_points = np.concatenate([source_world, query_world[query_valid]], axis=0)
+    colors = np.concatenate([source_rgb, query_rgb[query_valid]], axis=0)
+    normals_cv = np.concatenate([source_normal_cv, query_normal_cv[query_valid]], axis=0)
+    normals_world = _normals_to_world(normals_cv, config)
+    all_valid = np.ones(len(world_points), dtype=bool)
+    normal_valid = np.isfinite(normals_world).all(axis=-1)
+    bev = build_bev_outputs(colors, world_points, normals_world, all_valid, config.bev, normal_valid_mask=normal_valid)
+    final_rgb = bev.bev_rgb
+    surface_newly_count = 0
+    surface_cell_count = 0
+    if floor_surface is not None:
+        final_rgb = floor_surface.bev_rgb.copy()
+        point_mask = bev.bev_rgb[..., 3] > 0
+        final_rgb[point_mask] = bev.bev_rgb[point_mask]
+        surface_newly = np.where((floor_surface.bev_valid > 0) & (bev_valid_before == 0), 255, 0).astype(np.uint8)
+        Image.fromarray(floor_surface.bev_rgb).save(branch_dir / "floor_surface_rgb.png")
+        Image.fromarray(floor_surface.bev_valid).save(branch_dir / "floor_surface_valid.png")
+        Image.fromarray(surface_newly).save(branch_dir / "floor_surface_newly_covered_bev_cells.png")
+        surface_newly_count = int(np.count_nonzero(surface_newly))
+        surface_cell_count = int(np.count_nonzero(floor_surface.bev_valid))
+    bev_valid = np.maximum(bev_valid_before, bev.bev_valid)
+    if floor_surface is not None:
+        bev_valid = np.maximum(bev_valid, floor_surface.bev_valid)
+    newly = np.where((bev_valid > 0) & (bev_valid_before == 0), 255, 0).astype(np.uint8)
+    Image.fromarray(final_rgb).save(branch_dir / "bev_rgb.png")
+    Image.fromarray(bev_valid).save(branch_dir / "bev_valid.png")
+    Image.fromarray(newly).save(branch_dir / "newly_covered_bev_cells.png")
+    Image.fromarray(255 - bev.observed_top_occupancy).save(branch_dir / "observed_top_occupancy.png")
+    np.save(branch_dir / "observed_top_occupancy.npy", bev.observed_top_occupancy)
+    Image.fromarray(bev.top_probability_map).save(branch_dir / "top_probability_map.png")
+    return {
+        f"{name}_query_count": int(query_valid.sum()),
+        f"{name}_bev_unique_cells": int(np.count_nonzero(bev_valid)),
+        f"{name}_newly_covered_bev_cells": int(np.count_nonzero(newly)),
+        f"{name}_floor_surface_fill_cells": surface_cell_count,
+        f"{name}_floor_surface_newly_covered_bev_cells": surface_newly_count,
+    }
+
+
+def _finite_stats(prefix: str, values: np.ndarray, mask: np.ndarray | None = None) -> dict[str, float | int]:
+    valid = np.isfinite(values)
+    if mask is not None:
+        valid &= mask
+    samples = values[valid]
+    if len(samples) == 0:
+        return {f"{prefix}_count": 0}
+    p50, p90, p95, p99 = np.percentile(samples, [50, 90, 95, 99])
+    return {
+        f"{prefix}_count": int(len(samples)),
+        f"{prefix}_p50": float(p50),
+        f"{prefix}_p90": float(p90),
+        f"{prefix}_p95": float(p95),
+        f"{prefix}_p99": float(p99),
+        f"{prefix}_max": float(np.max(samples)),
+    }
+
+
+def _sample_map_at_query(value: np.ndarray, source_uv: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+    """Pixel-center query 좌표에서 scalar/vector map을 strict bilinear sampling한다."""
+
+    array = np.asarray(value)
+    x = source_uv[:, 0] - 0.5
+    y = source_uv[:, 1] - 0.5
+    h, w = array.shape[:2]
+    inside = np.isfinite(x) & np.isfinite(y) & (x >= 0.0) & (x <= w - 1.0) & (y >= 0.0) & (y <= h - 1.0)
+    x0 = np.floor(np.clip(x, 0.0, w - 1.0)).astype(np.int64)
+    y0 = np.floor(np.clip(y, 0.0, h - 1.0)).astype(np.int64)
+    x1, y1 = np.minimum(x0 + 1, w - 1), np.minimum(y0 + 1, h - 1)
+    wx, wy = x - x0, y - y0
+    v00, v10 = array[y0, x0], array[y0, x1]
+    v01, v11 = array[y1, x0], array[y1, x1]
+    if array.ndim == 3:
+        wx = wx[:, None]
+        wy = wy[:, None]
+        finite = np.isfinite(v00).all(axis=-1) & np.isfinite(v10).all(axis=-1)
+        finite &= np.isfinite(v01).all(axis=-1) & np.isfinite(v11).all(axis=-1)
+    else:
+        finite = np.isfinite(v00) & np.isfinite(v10) & np.isfinite(v01) & np.isfinite(v11)
+        finite &= (v00 > 0.0) & (v10 > 0.0) & (v01 > 0.0) & (v11 > 0.0)
+    sampled = (
+        (1.0 - wx) * (1.0 - wy) * v00
+        + wx * (1.0 - wy) * v10
+        + (1.0 - wx) * wy * v01
+        + wx * wy * v11
+    ).astype(np.float32)
+    return sampled, inside & finite
+
+
+def _depth_error_metrics(prefix: str, prediction: np.ndarray, target: np.ndarray, valid: np.ndarray) -> dict[str, float | int]:
+    mask = valid & np.isfinite(prediction) & np.isfinite(target) & (prediction > 0.0) & (target > 0.0)
+    if not np.any(mask):
+        return {f"{prefix}_count": 0}
+    error = prediction[mask] - target[mask]
+    return {
+        f"{prefix}_count": int(mask.sum()),
+        f"{prefix}_abs_rel": float(np.mean(np.abs(error) / target[mask].clip(min=1.0e-6))),
+        f"{prefix}_rmse": float(np.sqrt(np.mean(error**2))),
+    }
+
+
+def _evaluate_matching_isaac_gt(
+    config: PipelineConfig,
+    run_dir: Path,
+    rgb_hash: str,
+    external_depth: ExternalDepthPrediction | None,
+    primary: BackbonePrediction,
+    rgb: np.ndarray,
+    rays: np.ndarray,
+    queries: RayQuerySet,
+    completion: dict[str, np.ndarray | bool],
+) -> dict[str, object]:
+    """현재 RGB hash와 일치하는 Isaac GT를 모델 입력과 분리해 평가한다."""
+
+    if not config.toggles.enable_gt_evaluation:
+        return {"gt_evaluation_skipped": True, "gt_evaluation_skipped_reason": "disabled"}
+    if config.eval.use_isaac_gt_only_on_hash_match and rgb_hash.lower() != config.eval.input_rgb_sha256.lower():
+        return {"gt_evaluation_skipped": True, "gt_evaluation_skipped_reason": "RGB hash mismatch"}
+    gt_path = config.paths.isaac_reference_run / "depth_z.npy"
+    if not gt_path.exists():
+        return {"gt_evaluation_skipped": True, "gt_evaluation_skipped_reason": "GT depth not found"}
+    if external_depth is not None and sha256_file(gt_path) == external_depth.metadata["external_depth_sha256"]:
+        return {
+            "gt_evaluation_skipped": True,
+            "gt_evaluation_skipped_reason": "external depth input is byte-identical to Isaac GT",
+        }
+    gt_depth = np.load(gt_path).astype(np.float32)
+    gt_valid = rays[..., 2] > config.camera.geometry_z_eps
+    gt_valid &= np.isfinite(gt_depth) & (gt_depth > 0.0)
+    dense_error = np.full_like(gt_depth, np.nan)
+    dense_mask = gt_valid & np.isfinite(primary.depth0_z) & (primary.depth0_z > 0.0)
+    dense_error[dense_mask] = np.abs(primary.depth0_z[dense_mask] - gt_depth[dense_mask]) / gt_depth[dense_mask]
+    np.save(run_dir / "depth_gt_absrel_error.npy", dense_error)
+    save_heatmap(run_dir / "depth_gt_absrel_error.png", dense_error)
+
+    query_gt, query_gt_valid = _sample_map_at_query(gt_depth, queries.source_uv)
+    query_metrics = _depth_error_metrics(
+        "query_bilinear", np.asarray(completion["base_depth_z"]), query_gt, query_gt_valid
+    )
+    query_metrics.update(
+        _depth_error_metrics("query_completion", np.asarray(completion["depth_z"]), query_gt, query_gt_valid)
+    )
+    query_error = np.full(rgb.shape[:2], np.nan, dtype=np.float32)
+    xy = np.rint(queries.source_uv - 0.5).astype(np.int64)
+    valid_xy = query_gt_valid & (xy[:, 0] >= 0) & (xy[:, 0] < rgb.shape[1]) & (xy[:, 1] >= 0) & (xy[:, 1] < rgb.shape[0])
+    relative_error = np.abs(np.asarray(completion["depth_z"]) - query_gt) / query_gt.clip(min=1.0e-6)
+    query_error[xy[valid_xy, 1], xy[valid_xy, 0]] = relative_error[valid_xy]
+    np.save(run_dir / "completion_depth_gt_absrel_error.npy", query_error)
+    save_heatmap(run_dir / "completion_depth_gt_absrel_error.png", query_error)
+
+    gt_prediction = BackbonePrediction(
+        branch="gt",
+        depth0_z=gt_depth,
+        normal0=np.zeros((*gt_depth.shape, 3), dtype=np.float32),
+        valid=gt_valid,
+        metadata={},
+    )
+    gt_geometry = _dense_source_geometry(config, gt_prediction, rgb, rays, gt_valid)
+    query_gt_normal, normal_sample_valid = _sample_map_at_query(gt_geometry["normal"], queries.source_uv)
+    query_gt_normal /= np.linalg.norm(query_gt_normal, axis=-1, keepdims=True).clip(min=1.0e-6)
+    pred_normal = np.asarray(completion["normal"])
+    normal_valid = normal_sample_valid & np.isfinite(pred_normal).all(axis=-1)
+    normal_error = np.full(len(queries), np.nan, dtype=np.float32)
+    if np.any(normal_valid):
+        cosine = np.sum(pred_normal[normal_valid] * query_gt_normal[normal_valid], axis=-1)
+        normal_error[normal_valid] = np.rad2deg(np.arccos(np.clip(cosine, -1.0, 1.0)))
+    normal_error_map = np.full(rgb.shape[:2], np.nan, dtype=np.float32)
+    normal_xy = valid_xy & normal_valid
+    normal_error_map[xy[normal_xy, 1], xy[normal_xy, 0]] = normal_error[normal_xy]
+    np.save(run_dir / "normal_gt_angular_error.npy", normal_error_map)
+    save_heatmap(run_dir / "normal_gt_angular_error.png", normal_error_map, value_min=0.0, value_max=90.0)
+    query_metrics.update(_depth_error_metrics("source_d0", primary.depth0_z, gt_depth, dense_mask))
+    query_metrics["query_normal_gt_count"] = int(normal_valid.sum())
+    query_metrics["query_normal_gt_mean_degrees"] = float(np.nanmean(normal_error)) if np.any(normal_valid) else float("nan")
+    query_metrics["gt_evaluation_skipped"] = False
+    return query_metrics
+
+
+def validate_environment(config: PipelineConfig | None = None) -> dict:
     config = config or make_default_config()
     rays = build_fisheye_rays(config.camera)
     gap, _ = cell_angular_gap(rays.rays_cv, rays.valid)
@@ -377,96 +581,63 @@ def validate_environment(config: PipelineConfig | None = None) -> dict:
         "input_rgb_exists": config.paths.input_rgb.exists(),
         "nyu_mat_exists": config.paths.nyu_mat.exists(),
         "depth_anything_root_exists": config.paths.depth_anything_root.exists(),
-        "depth_anything_vitl_ckpt_exists": config.paths.depth_anything_vitl_ckpt.exists(),
+        "depth_anything_checkpoint_exists": config.paths.depth_anything_vitl_ckpt.exists(),
         "dsine_root_exists": config.paths.dsine_root.exists(),
-        "dsine_ckpt_exists": config.paths.dsine_ckpt.exists(),
+        "dsine_checkpoint_exists": config.paths.dsine_ckpt.exists(),
         "fisheye_valid_pixels": int(rays.valid.sum()),
         "fisheye_roundtrip_max_error_px": rays.max_roundtrip_error_px,
         "gap_before_max_rad": float(np.nanmax(gap)),
     }
     if config.backbone.depth_source == "external_npy":
         try:
-            external = load_external_z_depth(
-                config.paths.external_depth_z,
-                (config.camera.height, config.camera.width),
-            )
-            checks.update(
-                {
-                    "external_depth_exists": True,
-                    "external_depth_shape_valid": True,
-                    "external_depth_valid_pixels": int(external.valid.sum()),
-                    "external_depth_sha256": external.metadata["external_depth_sha256"],
-                }
-            )
-        except (FileNotFoundError, ValueError) as exc:
-            checks.update(
-                {
-                    "external_depth_exists": config.paths.external_depth_z.exists(),
-                    "external_depth_shape_valid": False,
-                    "external_depth_error": str(exc),
-                }
-            )
+            external = load_external_z_depth(config.paths.external_depth_z, (config.camera.height, config.camera.width))
+            checks["external_depth_valid_pixels"] = int(external.valid.sum())
+            checks["external_depth_shape_valid"] = True
+        except (FileNotFoundError, ValueError) as error:
+            checks["external_depth_shape_valid"] = False
+            checks["external_depth_error"] = str(error)
     return checks
 
 
 def run_inference(config: PipelineConfig | None = None) -> Path:
-    """현재 ``rgb.png``에 3D·BEV guided ray 보완 파이프라인을 실행한다.
-
-    backbone D0가 있어야 실제 surface/BEV 간격을 계산할 수 있으므로, 과거의
-    angular-only 구현과 달리 backbone을 query sampler보다 먼저 실행한다.
-    """
+    """현재 fisheye RGB에 Convex Quad RGB-D ray completion과 두 BEV branch를 실행한다."""
 
     config = config or make_default_config()
     ensure_output_roots(config)
     run_dir = create_run_dir(config, "infer")
     rgb = load_rgb(config.paths.input_rgb)
+    if rgb.shape[:2] != (config.camera.height, config.camera.width):
+        raise ValueError(f"입력 RGB shape {rgb.shape[:2]}가 camera 설정과 다릅니다.")
     rgb_hash = sha256_file(config.paths.input_rgb)
-    depth_source = config.backbone.depth_source
-    if depth_source not in {"da_v2", "external_npy"}:
-        raise ValueError(f"Unsupported depth_source={depth_source!r}; expected 'da_v2' or 'external_npy'.")
-    external_depth: ExternalDepthPrediction | None = None
-    if depth_source == "external_npy":
-        external_depth = load_external_z_depth(config.paths.external_depth_z, rgb.shape[:2])
     save_rgb(run_dir / "source_rgb.png", rgb)
     shutil.copy2(config.paths.input_rgb, run_dir / "input_rgb_original.png")
     save_config(config, run_dir / "config.json")
-
     rays = build_fisheye_rays(config.camera)
     np.save(run_dir / "source_rays.npy", rays.rays_cv.astype(np.float32))
 
-    # D0/N0가 먼저 만들어져야 추가 ray를 실제 3D·BEV 희소 위치에 배치할 수 있다.
-    predictions: list[BackbonePrediction] = []
+    external_depth: ExternalDepthPrediction | None = None
+    if config.backbone.depth_source == "external_npy":
+        external_depth = load_external_z_depth(config.paths.external_depth_z, rgb.shape[:2])
+    elif config.backbone.depth_source != "da_v2":
+        raise ValueError("depth_source는 'da_v2' 또는 'external_npy'여야 합니다.")
     runner = BackboneRunner(config.paths, config.backbone, config.camera)
-    depth_override_z = None if external_depth is None else external_depth.depth_z
+    depth_override = None if external_depth is None else external_depth.depth_z
     depth_metadata = None if external_depth is None else external_depth.metadata
+    predictions: list[BackbonePrediction] = []
     if config.toggles.enable_direct_backbone:
-        direct = runner.run_direct(
-            rgb,
-            depth_override_z=depth_override_z,
-            depth_metadata=depth_metadata,
-        )
-        _save_prediction(run_dir, direct)
-        predictions.append(direct)
+        predictions.append(runner.run_direct(rgb, depth_override_z=depth_override, depth_metadata=depth_metadata))
     if config.toggles.enable_tangent_backbone:
-        tangent = runner.run_tangent(
-            rgb,
-            rays.rays_cv,
-            depth_override_z=depth_override_z,
-            depth_metadata=depth_metadata,
+        predictions.append(
+            runner.run_tangent(
+                rgb, rays.rays_cv, depth_override_z=depth_override, depth_metadata=depth_metadata
+            )
         )
-        _save_prediction(run_dir, tangent)
-        predictions.append(tangent)
     if not predictions:
-        raise RuntimeError("At least one backbone branch must be enabled.")
+        raise RuntimeError("direct 또는 tangent backbone을 하나 이상 켜야 합니다.")
+    for prediction in predictions:
+        _save_prediction(run_dir, prediction)
     primary = next((prediction for prediction in predictions if prediction.branch == "tangent"), predictions[0])
-    guidance_valid = (
-        rays.valid
-        & primary.valid
-        & np.isfinite(primary.depth0_z)
-        & (primary.depth0_z > 0.0)
-        & np.isfinite(primary.normal0).all(axis=-1)
-    )
-
+    guidance_valid = rays.valid & np.isfinite(primary.depth0_z) & (primary.depth0_z > 0.0)
     adaptive = generate_guided_observed_queries(
         rays.rays_cv,
         guidance_valid,
@@ -476,235 +647,179 @@ def run_inference(config: PipelineConfig | None = None) -> Path:
         config.ray,
         mode="surface_bev",
     )
+    queries = adaptive.queries if config.toggles.enable_adaptive_ray_generation else adaptive.queries.subset(np.zeros(len(adaptive.queries), dtype=bool))
     _save_adaptive_diagnostics(run_dir, adaptive)
-    source_queries = generate_source_queries(rays.rays_cv, guidance_valid)
-    observed_parts = [source_queries]
-    if config.toggles.enable_adaptive_ray_generation:
-        observed_parts.append(adaptive.queries)
-    queries = merge_query_sets(observed_parts, config.ray)
-    applied_density = np.zeros_like(adaptive.added_density, dtype=np.float32)
-    applied_parent = queries.parent_cell[queries.added]
-    if len(applied_parent):
-        np.add.at(applied_density, (applied_parent[:, 0], applied_parent[:, 1]), 1.0)
-    np.save(run_dir / "adaptive_added_ray_density.npy", applied_density)
-    save_heatmap(run_dir / "adaptive_added_ray_density.png", applied_density)
-    np.save(run_dir / "added_ray_density.npy", applied_density)
-    save_heatmap(run_dir / "added_ray_density.png", applied_density)
+    np.save(run_dir / "source_cell_continuous.npy", queries.source_cell_continuous)
 
-    # 180도 후보는 coverage 전용으로 분리한다. Refiner/point/BEV query와 합치지 않는다.
     coverage = np.zeros((config.camera.height, config.camera.width), dtype=np.uint8)
-    hemisphere_count = 0
-    hemisphere_unknown_count = 0
+    hemisphere_count = hemisphere_unknown = 0
     if config.toggles.enable_front_hemisphere_queries:
-        hemisphere_queries, coverage = generate_front_hemisphere_queries(
-            config.camera,
-            rays.valid,
-            None,
-            config.ray,
-        )
-        hemisphere_count = len(hemisphere_queries)
-        hemisphere_unknown_count = int(hemisphere_queries.unknown.sum())
-        hemisphere_queries.save_npz(
+        hemisphere, coverage = generate_front_hemisphere_queries(config.camera, rays.valid, None, config.ray)
+        hemisphere_count = len(hemisphere)
+        hemisphere_unknown = int(hemisphere.unknown.sum())
+        hemisphere.save_npz(
             run_dir / "front_hemisphere_queries.npz",
-            depth0_z=np.full(hemisphere_count, np.nan, dtype=np.float32),
-            depth_final_z=np.full(hemisphere_count, np.nan, dtype=np.float32),
-            normal_final=np.full((hemisphere_count, 3), np.nan, dtype=np.float32),
+            depth_z=np.full(len(hemisphere), np.nan, dtype=np.float32),
+            rgb=np.full((len(hemisphere), 3), np.nan, dtype=np.float32),
+            confidence=np.full(len(hemisphere), np.nan, dtype=np.float32),
         )
     save_coverage(run_dir / "front_hemisphere_coverage.png", coverage)
 
-    # frozen foundation model은 Refiner와 동시에 GPU에 둘 필요가 없다.
     del runner
     gc.collect()
     if torch.cuda.is_available():
         torch.cuda.empty_cache()
 
-    # query 위치는 primary D0로 한 번만 정하고 모든 branch에 똑같이 적용한다.
-    refiner_outputs: dict[str, dict[str, np.ndarray]] = {}
+    branch_outputs: dict[str, dict[str, np.ndarray | bool]] = {}
     for prediction in predictions:
-        branch_out = run_refiner_on_queries(config, prediction, rgb, rays.rays_cv, rays.valid, queries)
-        refiner_outputs[prediction.branch] = branch_out
+        completion = run_completion_on_queries(config, prediction, rgb, rays.rays_cv, rays.valid, queries)
+        branch_outputs[prediction.branch] = completion
         branch_dir = run_dir / prediction.branch
-        np.save(branch_dir / "query_depth_final_z.npy", branch_out["depth_final_z"])
-        np.save(branch_dir / "query_normal_final.npy", branch_out["normal_final"])
-        np.save(branch_dir / "query_delta_log_depth.npy", branch_out["delta_log_depth"])
-    refiner_out = refiner_outputs[primary.branch]
+        np.save(branch_dir / "query_rgb_pred.npy", completion["rgb"])
+        np.save(branch_dir / "query_depth_pred_z.npy", completion["depth_z"])
+        np.save(branch_dir / "query_depth_model_z.npy", completion["model_depth_z"])
+        np.save(branch_dir / "query_valid_probability.npy", completion["valid_probability"])
+        np.save(branch_dir / "query_confidence_probability.npy", completion["confidence_probability"])
+        np.save(branch_dir / "query_normal_final.npy", completion["normal"])
+    completion = branch_outputs[primary.branch]
+    for filename, key in (
+        ("query_rgb_pred.npy", "rgb"),
+        ("query_depth_pred_z.npy", "depth_z"),
+        ("query_depth_model_z.npy", "model_depth_z"),
+        ("query_valid_probability.npy", "valid_probability"),
+        ("query_confidence_probability.npy", "confidence_probability"),
+    ):
+        np.save(run_dir / filename, completion[key])
+    _save_completion_previews(run_dir, rgb, queries, completion)
 
-    camera_points, world_points, radial, point_valid = _query_points(config, queries, refiner_out["depth_final_z"])
-    colors = _sample_query_rgb(rgb, queries)
-    normals_world = _normals_to_world(refiner_out["normal_final"], config)
-    np.save(run_dir / "query_points_camera.npy", camera_points.astype(np.float32))
-    np.save(run_dir / "query_points_world.npy", world_points.astype(np.float32))
-    np.save(run_dir / "query_points_rgb.npy", colors.astype(np.uint8))
+    query_camera, query_world, query_depth_valid = _query_geometry(config, queries, completion["depth_z"])
+    query_rgb = np.clip(np.asarray(completion["rgb"]) * 255.0, 0.0, 255.0).astype(np.uint8)
+    valid_probability = np.asarray(completion["valid_probability"])
+    confidence_probability = np.asarray(completion["confidence_probability"])
+    probability_mask = (
+        query_depth_valid
+        & (valid_probability >= config.completion.valid_probability_threshold)
+        & (confidence_probability >= config.completion.confidence_probability_threshold)
+    )
+    continuous_mask = probability_mask & queries.source_cell_continuous
+    edge_mask = probability_mask
+    if np.any(continuous_mask & ~edge_mask):
+        raise AssertionError("continuous_only는 edge_confident의 subset이어야 합니다.")
+
     queries.save_npz(
-        run_dir / "ray_queries.npz",
-        depth0_z=refiner_out["depth0_query_z"].astype(np.float32),
-        depth_final_z=refiner_out["depth_final_z"].astype(np.float32),
-        normal_final=refiner_out["normal_final"].astype(np.float32),
-        radial_depth=radial.astype(np.float32),
-        point_valid=point_valid.astype(bool),
-        source_valid_query=refiner_out["source_valid_query"].astype(bool),
+        run_dir / "quad_completion_queries.npz",
+        rgb_pred=np.asarray(completion["rgb"]),
+        depth_base_z=np.asarray(completion["base_depth_z"]),
+        depth_model_z=np.asarray(completion["model_depth_z"]),
+        depth_pred_z=np.asarray(completion["depth_z"]),
+        base_depth_applied=np.asarray(completion["base_depth_applied"]),
+        valid_probability=valid_probability,
+        confidence_probability=confidence_probability,
+        normal_final=np.asarray(completion["normal"]),
+        continuous_only=continuous_mask,
+        edge_confident=edge_mask,
     )
 
-    selected_cells = applied_density > 0.0
-    metrics: dict = {
+    source = _dense_source_geometry(config, primary, rgb, rays.rays_cv, rays.valid)
+    bev_valid_before = build_bev_valid(source["world_points"], source["valid"], config.bev)
+    Image.fromarray(bev_valid_before).save(run_dir / "bev_valid_before.png")
+    floor_surface = None
+    if config.toggles.enable_floor_surface_rasterization:
+        floor_surface = rasterize_floor_surfaces(source["rgb"], source["world_points"], source["valid"], config.bev)
+        np.save(run_dir / "floor_surface_source_cell_mask.npy", floor_surface.source_cell_mask)
+        save_mask(run_dir / "floor_surface_source_cell_mask.png", floor_surface.source_cell_mask)
+    metrics: dict[str, object] = {
         "rgb_sha256": rgb_hash,
-        "depth_source": depth_source,
+        "depth_source": config.backbone.depth_source,
         "primary_branch": primary.branch,
-        "query_guidance_branch": primary.branch,
-        "sampling_mode": "surface_bev",
-        "target_angular_gap_rad": adaptive.target_angular_gap_rad,
-        "target_surface_gap_m": config.ray.target_surface_gap_m,
-        "target_bev_gap_cells": config.ray.target_bev_gap_cells,
-        "source_query_count": int(len(source_queries)),
-        "adaptive_generated_query_count": int(len(adaptive.queries)),
-        "adaptive_added_query_count": int(queries.added.sum()),
-        "refiner_query_count": int(len(queries)),
-        "hemisphere_query_count": int(hemisphere_count),
-        "hemisphere_unknown_query_count": int(hemisphere_unknown_count),
-        "eligible_cell_count": int(adaptive.eligible_mask.sum()),
-        "selected_cell_count": int(selected_cells.sum()),
-        "candidate_query_count": int(adaptive.candidate_query_count),
-        "query_budget": int(adaptive.query_budget),
-        "query_budget_truncated": bool(adaptive.budget_truncated),
-        "refiner_enabled": bool(config.toggles.enable_refiner),
-        "refiner_checkpoint_loaded": bool(
-            config.toggles.enable_refiner
-            and config.paths.checkpoint is not None
-            and Path(config.paths.checkpoint).exists()
-        ),
+        "adaptive_query_count": len(queries),
+        "continuous_source_query_count": int(queries.source_cell_continuous.sum()),
+        "edge_source_query_count": int((~queries.source_cell_continuous).sum()),
+        "continuous_base_depth_enabled": bool(config.completion.use_base_depth_for_continuous_queries),
+        "continuous_base_depth_applied_count": int(np.asarray(completion["base_depth_applied"]).sum()),
+        "valid_probability_pass_count": int((valid_probability >= config.completion.valid_probability_threshold).sum()),
+        "confidence_probability_pass_count": int((confidence_probability >= config.completion.confidence_probability_threshold).sum()),
+        "checkpoint_loaded": bool(completion["checkpoint_loaded"]),
+        "checkpoint": str(config.paths.checkpoint) if config.paths.checkpoint is not None else None,
+        "candidate_query_count": adaptive.candidate_query_count,
+        "query_budget": adaptive.query_budget,
+        "query_budget_truncated": adaptive.budget_truncated,
+        "hemisphere_query_count": hemisphere_count,
+        "hemisphere_unknown_query_count": hemisphere_unknown,
+        "bev_unique_cells_before": int(np.count_nonzero(bev_valid_before)),
+        "floor_surface_rasterization_enabled": bool(config.toggles.enable_floor_surface_rasterization),
+        "floor_surface_source_cell_count": int(floor_surface.source_cell_mask.sum()) if floor_surface is not None else 0,
+        "floor_surface_floor_z": float(floor_surface.floor_z) if floor_surface is not None else float("nan"),
     }
-    adaptive_density_metrics = _density_region_metrics(applied_density)
-    metrics.update(adaptive_density_metrics)
-    metrics.update({f"adaptive_{key}": value for key, value in adaptive_density_metrics.items()})
-    metrics.update(_finite_stats("surface_gap_before_selected_m", adaptive.surface_gap_before_m, selected_cells))
-    metrics.update(_finite_stats("surface_gap_planned_after_selected_m", adaptive.surface_gap_planned_after_m, selected_cells))
-    metrics.update(_finite_stats("bev_gap_before_selected_cells", adaptive.bev_gap_before_cells, selected_cells))
-    metrics.update(_finite_stats("bev_gap_planned_after_selected_cells", adaptive.bev_gap_planned_after_cells, selected_cells))
-
+    metrics.update(_finite_stats("surface_gap_before_m", adaptive.surface_gap_before_m))
+    metrics.update(_finite_stats("surface_gap_after_m", adaptive.surface_gap_planned_after_m))
+    metrics.update(_finite_stats("bev_gap_before_cells", adaptive.bev_gap_before_cells))
+    metrics.update(_finite_stats("bev_gap_after_cells", adaptive.bev_gap_planned_after_cells))
     if external_depth is not None:
         metrics.update(external_depth.metadata)
-
-    gt = _load_matching_isaac_gt(config, rgb_hash)
-    gt_is_external_input = False
-    if gt is not None and external_depth is not None:
-        gt_path = config.paths.isaac_reference_run / "depth_z.npy"
-        gt_is_external_input = (
-            gt_path.is_file()
-            and sha256_file(gt_path) == external_depth.metadata["external_depth_sha256"]
+    metrics.update(
+        _evaluate_matching_isaac_gt(
+            config,
+            run_dir,
+            rgb_hash,
+            external_depth,
+            primary,
+            rgb,
+            rays.rays_cv,
+            queries,
+            completion,
         )
-    if gt_is_external_input:
-        metrics["gt_evaluation_skipped"] = True
-        metrics["gt_evaluation_skipped_reason"] = (
-            "external depth input is byte-identical to the Isaac evaluation GT; metrics would leak ground truth"
-        )
-    elif gt is not None:
-        # GT는 hash가 같은 reference에서 평가에만 사용하며 sampler/refiner 입력에는 사용하지 않는다.
-        error_map, gt_metrics = _error_maps(primary.depth0_z, gt["depth_z"], guidance_valid)
-        save_heatmap(run_dir / "depth_gt_absrel_error.png", error_map)
-        np.save(run_dir / "depth_gt_absrel_error.npy", error_map)
-        metrics.update(gt_metrics)
-        target_query_depth = _sample_query_map(gt["depth_z"], queries)
-        query_mask = point_valid & queries.observed
-        metrics.update(_query_depth_metrics("query_d0", refiner_out["depth0_query_z"], target_query_depth, query_mask))
-        metrics.update(_query_depth_metrics("query_dstar", refiner_out["depth_final_z"], target_query_depth, query_mask))
+    )
 
     if config.toggles.enable_bev:
-        base_camera_points, _, base_valid = points_from_z_depth(
-            primary.depth0_z,
-            rays.rays_cv,
-            z_eps=config.camera.geometry_z_eps,
-        )
-        base_valid &= guidance_valid
-        base_world_points = camera_to_world_points(base_camera_points, config.camera).astype(np.float32)
-        bev_valid_before = build_bev_valid(base_world_points, base_valid, config.bev)
-        # coverage 증가는 added ray만으로 귀속한다. source D*가 D0 point를 이동시킨
-        # 효과를 "새 ray가 채운 cell"로 잘못 세지 않는다.
-        added_bev_valid = build_bev_valid(world_points, point_valid & queries.added, config.bev)
-        bev_valid_after_adaptive = np.maximum(bev_valid_before, added_bev_valid)
-
-        bev = build_bev_outputs(
-            colors,
-            world_points,
-            normals_world,
-            point_valid,
-            config.bev,
-            normal_valid_mask=np.isfinite(normals_world).all(axis=-1),
-        )
-        final_bev_rgb = bev.bev_rgb
-        final_bev_valid = np.maximum(bev_valid_after_adaptive, bev.bev_valid)
-        final_observed_top = bev.observed_top_occupancy
-        final_top_probability = bev.top_probability_map
-        combined_density = applied_density.copy()
-
-        if config.toggles.enable_dense_coverage_bev:
-            dense = build_dense_coverage_bev(
-                rgb,
-                primary.depth0_z,
-                rays.rays_cv,
-                guidance_valid,
-                config.camera,
-                config.bev,
-                config.ray,
-                base_bev_rgb=final_bev_rgb,
-                base_bev_valid=final_bev_valid,
-                base_top_occupancy=final_observed_top,
-                base_top_probability=final_top_probability,
-                floor_z=bev.floor_z,
+        metrics.update(
+            _save_bev_branch(
+                run_dir,
+                "continuous_only",
+                config,
+                source,
+                query_camera,
+                query_world,
+                query_rgb,
+                np.asarray(completion["normal"]),
+                continuous_mask,
+                bev_valid_before,
+                floor_surface,
             )
-            final_bev_rgb = dense.bev_rgb
-            final_bev_valid = dense.bev_valid
-            if dense.observed_top_occupancy is not None:
-                final_observed_top = dense.observed_top_occupancy
-            if dense.top_probability_map is not None:
-                final_top_probability = dense.top_probability_map
-            final_support_occupancy = dense.observed_support_occupancy
-            combined_density = combined_density + dense.added_density
-            np.save(run_dir / "dense_added_ray_density.npy", dense.added_density)
-            save_heatmap(run_dir / "dense_added_ray_density.png", dense.added_density)
-            metrics.update(dense.metrics)
-        else:
-            metrics["dense_coverage_enabled"] = False
-            final_support_occupancy = np.where(final_bev_valid > 0, 255, 0).astype(np.uint8)
-
-        newly_covered = np.where((final_bev_valid > 0) & (bev_valid_before == 0), 255, 0).astype(np.uint8)
-        np.save(run_dir / "added_ray_density.npy", combined_density)
-        save_heatmap(run_dir / "added_ray_density.png", combined_density)
-        Image.fromarray(bev_valid_before).save(run_dir / "bev_valid_before.png")
-        Image.fromarray(final_bev_valid).save(run_dir / "bev_valid_after.png")
-        Image.fromarray(newly_covered).save(run_dir / "newly_covered_bev_cells.png")
-        Image.fromarray(final_bev_rgb).save(run_dir / "bev_rgb.png")
-        Image.fromarray(final_bev_valid).save(run_dir / "bev_valid.png")
-        Image.fromarray(255 - final_observed_top).save(run_dir / "observed_top_occupancy.png")
-        np.save(run_dir / "observed_top_occupancy.npy", final_observed_top)
-        Image.fromarray(255 - final_support_occupancy).save(run_dir / "observed_support_occupancy.png")
-        np.save(run_dir / "observed_support_occupancy.npy", final_support_occupancy)
-        Image.fromarray(final_top_probability).save(run_dir / "top_probability_map.png")
-        metrics.update(_density_region_metrics(combined_density))
-        metrics["bev_unique_cells_before"] = int(np.count_nonzero(bev_valid_before))
-        metrics["bev_unique_cells_after_adaptive"] = int(np.count_nonzero(bev_valid_after_adaptive))
-        metrics["bev_unique_cells_after"] = int(np.count_nonzero(final_bev_valid))
-        metrics["bev_newly_covered_cells"] = int(np.count_nonzero(newly_covered))
-        metrics["bev_valid_cells_with_final_normals"] = int(np.count_nonzero(bev.bev_valid))
-        metrics["observed_top_cells"] = int(np.count_nonzero(final_observed_top))
-        metrics["observed_support_cells"] = int(np.count_nonzero(final_support_occupancy))
-        metrics.update(bev.metadata)
+        )
+        metrics.update(
+            _save_bev_branch(
+                run_dir,
+                "edge_confident",
+                config,
+                source,
+                query_camera,
+                query_world,
+                query_rgb,
+                np.asarray(completion["normal"]),
+                edge_mask,
+                bev_valid_before,
+                floor_surface,
+            )
+        )
+        # 기본 최종 결과는 edge_confident branch다.
+        for filename in ("bev_rgb.png", "bev_valid.png", "newly_covered_bev_cells.png", "observed_top_occupancy.png", "top_probability_map.png"):
+            shutil.copy2(run_dir / "edge_confident" / filename, run_dir / filename)
 
     metadata = {
-        "pipeline": "wide_fov_supervision_v2 D0-guided 3D/BEV adaptive ray + ray-aware refiner",
-        "depth_source": depth_source,
-        "depth_source_semantics": (
-            "external source-camera z-depth in metres"
-            if external_depth is not None
-            else "Depth Anything V2 metric z-depth"
-        ),
-        "gt_evaluation_is_independent": not gt_is_external_input,
-        "ray_generation_semantics": "camera geometry deterministically creates ray directions; the learned refiner predicts only query z-depth",
-        "dense_coverage_semantics": "dense source-cell rays are streamed directly into BEV with the selected D0 depth source; they are not stored in ray_queries.npz",
-        "observed_support_occupancy_semantics": "black PNG pixels mean any observed BEV support after source, adaptive, and dense rays; this is coverage, not top-facing occupancy",
-        "planned_after_semantics": "planned-after maps show the requested subdivision before the query budget; selected cells are identified by added_ray_density",
-        "front_hemisphere_semantics": "180-degree candidates are coverage-only and are never passed to the refiner, loss, 3D point cloud, or BEV",
-        "occupancy_semantics": "observed_top_occupancy is not a classic free/occupied map; black PNG means observed top-facing non-floor surface",
-        "branches": [prediction.branch for prediction in predictions],
+        "pipeline": "convex-quad four-support RGB-D ray completion",
+        "ray_generation_semantics": "ray direction/count are deterministic camera geometry; the model restores RGB-D attributes only",
+        "quad_assumption": "a wide convex quadrilateral sampled from public RGB-D approximates a sparse adjacent 2x2 fisheye ray cell; it does not recover a real camera pose",
+        "scale_semantics": "output depth follows the valid median scale of the four support depths; DA-V2 global scale is not newly identified",
+        "depth_policy": "continuous source cells use corner-bilinear base depth for final geometry; discontinuous edge cells use completion model depth",
+        "confidence_semantics": "valid means observable RGB-D; confidence means locally continuous enough to insert into 3D/BEV",
+        "branch_semantics": {
+            "continuous_only": "source cell is depth-continuous and valid/confidence pass thresholds",
+            "edge_confident": "all adaptive cells are considered and valid/confidence pass thresholds",
+        },
+        "front_hemisphere_semantics": "unknown 180-degree rays are coverage-only and never enter completion, point cloud, or BEV",
+        "floor_surface_rasterization_semantics": "continuous source cells near the estimated floor height are filled as BEV polygons behind point splats; these floor fills do not enter top-facing non-floor occupancy",
+        "occupancy_semantics": "black observed_top_occupancy pixels mean observed top-facing non-floor surface; this is not a classic free/occupied grid",
         "backbone_metadata": {prediction.branch: prediction.metadata for prediction in predictions},
         "config": config_to_dict(config),
     }
@@ -717,29 +832,39 @@ def run_inference(config: PipelineConfig | None = None) -> Path:
             metrics,
             [
                 "source_rgb.png",
-                "ray_gap_before.png",
-                "ray_gap_after.png",
+                "quad_sampling_preview.png",
+                "completion_rgb_preview.png",
+                "completion_depth_preview.png",
+                "confidence_map.png",
                 "surface_gap_before_m.png",
                 "surface_gap_planned_after_m.png",
                 "bev_gap_before_cells.png",
                 "bev_gap_planned_after_cells.png",
                 "sampling_priority.png",
                 "sampling_eligible.png",
-                "planned_added_ray_density.png",
-                "adaptive_added_ray_density.png",
-                "dense_added_ray_density.png",
                 "added_ray_density.png",
+                "floor_surface_source_cell_mask.png",
                 "front_hemisphere_coverage.png",
                 f"{primary.branch}/depth0_z.png",
                 f"{primary.branch}/normal0.png",
                 "depth_gt_absrel_error.png",
+                "completion_depth_gt_absrel_error.png",
+                "normal_gt_angular_error.png",
                 "bev_valid_before.png",
-                "bev_valid_after.png",
-                "newly_covered_bev_cells.png",
-                "bev_rgb.png",
-                "observed_top_occupancy.png",
-                "observed_support_occupancy.png",
-                "top_probability_map.png",
+                "continuous_only/bev_rgb.png",
+                "continuous_only/bev_valid.png",
+                "continuous_only/newly_covered_bev_cells.png",
+                "continuous_only/floor_surface_rgb.png",
+                "continuous_only/floor_surface_valid.png",
+                "continuous_only/floor_surface_newly_covered_bev_cells.png",
+                "edge_confident/bev_rgb.png",
+                "edge_confident/bev_valid.png",
+                "edge_confident/newly_covered_bev_cells.png",
+                "edge_confident/floor_surface_rgb.png",
+                "edge_confident/floor_surface_valid.png",
+                "edge_confident/floor_surface_newly_covered_bev_cells.png",
+                "edge_confident/observed_top_occupancy.png",
+                "edge_confident/top_probability_map.png",
             ],
         )
     return run_dir
