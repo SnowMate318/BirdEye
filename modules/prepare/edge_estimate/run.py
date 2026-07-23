@@ -39,7 +39,11 @@ def _parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         description="격리된 NYU 기반 fisheye 3D edge completion 가설 검증 파이프라인"
     )
-    parser.add_argument("--mode", choices=("validate", "cache", "train", "evaluate", "infer", "all"), required=True)
+    parser.add_argument(
+        "--mode",
+        choices=("validate", "cache", "train", "evaluate", "infer", "all"),
+        required=True,
+    )
     parser.add_argument("--variant", choices=(*VARIANTS, "all"), default="rgb_local")
     parser.add_argument("--input-rgb", type=str, default=None)
     parser.add_argument("--evaluation-depth", type=str, default=None)

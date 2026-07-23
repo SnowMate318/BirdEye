@@ -394,6 +394,9 @@ def evaluate_model(
     far_masks: list[np.ndarray] = []
     confidence_probabilities: list[np.ndarray] = []
     confidence_targets: list[np.ndarray] = []
+    bev_keep_probabilities: list[np.ndarray] = []
+    bev_keep_targets: list[np.ndarray] = []
+    bev_keep_masks: list[np.ndarray] = []
     type_confusion = np.zeros((3, 3), dtype=np.int64)
     geometry_values: dict[str, list[float]] = defaultdict(list)
     frame_counts: dict[int, np.ndarray] = defaultdict(lambda: np.zeros(3, dtype=np.int64))
@@ -418,6 +421,9 @@ def evaluate_model(
         far_masks.append(batch["target_far_valid"].cpu().numpy())
         confidence_probabilities.append(torch.sigmoid(result.query_confidence_logit).cpu().numpy())
         confidence_targets.append(batch["target_confidence"].cpu().numpy())
+        bev_keep_probabilities.append(torch.sigmoid(result.query_bev_keep_logit).cpu().numpy())
+        bev_keep_targets.append(batch["target_bev_keep"].cpu().numpy())
+        bev_keep_masks.append(batch["target_bev_keep_valid"].cpu().numpy())
         type_prediction = result.cell_type_logits.argmax(dim=-1) + 1
         type_target = batch["target_cell_type"].long()
         type_mask = batch["cell_valid"].bool() & (type_target > 0)
@@ -484,6 +490,12 @@ def evaluate_model(
         np.concatenate(confidence_probabilities), np.concatenate(confidence_targets), query_mask_array
     )
     metrics.update({f"confidence_{key}": value for key, value in confidence_binary.items()})
+    bev_keep = _binary_metrics(
+        np.concatenate(bev_keep_probabilities),
+        np.concatenate(bev_keep_targets),
+        np.concatenate(bev_keep_masks),
+    )
+    metrics.update({f"bev_keep_{key}": value for key, value in bev_keep.items()})
     metrics["shared_boundary_probability_disagreement"] = _boundary_disagreement(
         query_probability_array, query_mask_array, side
     )
@@ -1015,7 +1027,7 @@ def _refine_candidates(
         relative_t = torch.from_numpy(np.broadcast_to(relative, (len(cells), *relative.shape)).copy()).to(device)
         prior_depth_t = torch.from_numpy(query_prior_depth).to(device)
         prior_valid_t = torch.from_numpy(query_prior_valid).to(device)
-        edge_logit, near, far, confidence_logit, delta_log_depth = model.decode_selected_queries(
+        edge_logit, near, far, confidence_logit, bev_keep_logit, delta_log_depth = model.decode_selected_queries(
             selected_features, query_ray_t, relative_t, prior_depth_t, prior_valid_t
         )
         edge_probability = torch.sigmoid(edge_logit).cpu().numpy()
@@ -1026,6 +1038,7 @@ def _refine_candidates(
         pieces["edge_probability"].append(edge_probability.reshape(-1))
         pieces["nms_keep"].append(nms_keep.reshape(-1))
         pieces["confidence"].append(torch.sigmoid(confidence_logit).cpu().numpy().reshape(-1))
+        pieces["bev_keep_probability"].append(torch.sigmoid(bev_keep_logit).cpu().numpy().reshape(-1))
         pieces["delta_log_depth"].append(delta_log_depth.cpu().numpy().reshape(-1))
         pieces["prior_depth_z"].append(query_prior_depth.reshape(-1))
         pieces["prior_depth_valid"].append(query_prior_valid.reshape(-1))
@@ -1042,6 +1055,7 @@ def _refine_candidates(
             "edge_probability": np.empty(0, np.float32),
             "nms_keep": np.empty(0, bool),
             "confidence": np.empty(0, np.float32),
+            "bev_keep_probability": np.empty(0, np.float32),
             "delta_log_depth": np.empty(0, np.float32),
             "prior_depth_z": np.empty(0, np.float32),
             "prior_depth_valid": np.empty(0, bool),
@@ -1285,20 +1299,37 @@ def _save_variant_result(
         save_heatmap(target / "edge_2d_prior.png", edge_prior_2d, value_min=0.0, value_max=1.0)
     save_heatmap(target / "coarse_edge_probability.png", coarse, value_min=0.0, value_max=1.0)
     unknown = ~selected
-    queries_to_save = {**queries, "completed": selected.copy(), "unknown": unknown}
+    bev_selected = selected & (
+        queries["bev_keep_probability"] >= config.inference.bev_keep_threshold
+    )
+    queries_to_save = {
+        **queries,
+        "completed": selected.copy(),
+        "bev_selected": bev_selected.copy(),
+        "unknown": unknown,
+    }
     np.savez_compressed(target / "edge_queries.npz", **queries_to_save)
     probability_map = _raster_queries(rgb.shape[:2], queries["source_uv"], queries["edge_probability"], queries["confidence"], selected)
     confidence_map = _raster_queries(rgb.shape[:2], queries["source_uv"], queries["confidence"], queries["confidence"], selected)
+    bev_keep_map = _raster_queries(
+        rgb.shape[:2],
+        queries["source_uv"],
+        queries["bev_keep_probability"],
+        queries["confidence"],
+        selected,
+    )
     near_map = _raster_queries(rgb.shape[:2], queries["source_uv"], queries["depth_near_z"], queries["confidence"], selected)
     far_selected = selected & (queries["edge_type"] == EDGE_OCCLUSION)
     far_map = _raster_queries(rgb.shape[:2], queries["source_uv"], queries["depth_far_z"], queries["confidence"], far_selected)
     type_map = _raster_queries(rgb.shape[:2], queries["source_uv"], queries["edge_type"].astype(np.float32), queries["confidence"], selected)
     np.save(target / "edge_probability.npy", probability_map)
     np.save(target / "edge_confidence.npy", confidence_map)
+    np.save(target / "bev_keep_probability.npy", bev_keep_map)
     np.save(target / "edge_depth_near_z.npy", near_map)
     np.save(target / "edge_depth_far_z.npy", far_map)
     save_heatmap(target / "edge_probability.png", probability_map, value_min=0.0, value_max=1.0)
     save_heatmap(target / "edge_confidence.png", confidence_map, value_min=0.0, value_max=1.0)
+    save_heatmap(target / "bev_keep_probability.png", bev_keep_map, value_min=0.0, value_max=1.0)
     save_depth(target / "edge_depth_near_z.png", near_map)
     save_depth(target / "edge_depth_far_z.png", far_map)
     save_heatmap(target / "edge_type.png", type_map, cmap_name="tab10", value_min=0.0, value_max=3.0)
@@ -1308,13 +1339,18 @@ def _save_variant_result(
         queries["depth_near_z"], queries["ray_dir"], z_eps=config.base.camera.geometry_z_eps
     )
     near_valid &= selected
+    near_bev_valid = near_valid & bev_selected
     near_world = camera_to_world_points(near_camera, config.base.camera).astype(np.float32)
     far_camera, _, far_valid = points_from_z_depth(
         queries["depth_far_z"], queries["ray_dir"], z_eps=config.base.camera.geometry_z_eps
     )
     far_valid &= far_selected
+    far_bev_valid = far_valid & bev_selected
     far_world = camera_to_world_points(far_camera, config.base.camera).astype(np.float32)
     order, offsets = _ordered_components(queries["source_uv"], selected, config.inference.contour_radius_px)
+    bev_order, bev_offsets = _ordered_components(
+        queries["source_uv"], bev_selected, config.inference.contour_radius_px
+    )
     np.savez_compressed(
         target / "edge_polylines_camera.npz",
         points=near_camera[order],
@@ -1340,14 +1376,22 @@ def _save_variant_result(
         near_valid,
     )
     far_order, far_offsets = _ordered_components(
-        queries["source_uv"], far_valid, config.inference.contour_radius_px
+        queries["source_uv"], far_bev_valid, config.inference.contour_radius_px
     )
     near_bev_raw = _bev_raster(
-        near_world, queries["confidence"], near_valid, config, order, offsets, dilate_output=False
+        near_world,
+        queries["confidence"],
+        near_bev_valid,
+        config,
+        bev_order,
+        bev_offsets,
+        dilate_output=False,
     )
     near_bev = cv2.dilate(near_bev_raw, np.ones((3, 3), np.uint8))
     near_bev_polyline, near_bev_occupancy = _bev_edge_map_layers(near_bev_raw)
-    far_bev = _bev_raster(far_world, queries["confidence"], far_valid, config, far_order, far_offsets)
+    far_bev = _bev_raster(
+        far_world, queries["confidence"], far_bev_valid, config, far_order, far_offsets
+    )
     edge_root = target / "edge_only"
     edge_root.mkdir(parents=True, exist_ok=True)
     np.save(edge_root / "bev_edge_probability.npy", near_bev)
@@ -1390,6 +1434,8 @@ def _save_variant_result(
     metrics = {
         "candidate_query_count": int(len(selected)),
         "completed_edge_count": int(selected.sum()),
+        "bev_selected_edge_count": int(bev_selected.sum()),
+        "bev_rejected_edge_count": int(np.sum(selected & ~bev_selected)),
         "unknown_count": int(unknown.sum()),
         "crease_count": int(np.sum(selected & (queries["edge_type"] == 1))),
         "occlusion_count": int(np.sum(selected & (queries["edge_type"] == 2))),
@@ -1433,15 +1479,15 @@ def _save_variant_result(
         gt_project_camera, _, gt_project_point_valid = points_from_z_depth(
             gt_project_depth, queries["ray_dir"], z_eps=config.base.camera.geometry_z_eps
         )
-        gt_project_valid = selected & (gt_project_weight > 1.0e-6) & gt_project_point_valid
+        gt_project_valid = bev_selected & (gt_project_weight > 1.0e-6) & gt_project_point_valid
         gt_project_world = camera_to_world_points(gt_project_camera, config.base.camera).astype(np.float32)
         gt_project_bev_raw = _bev_raster(
             gt_project_world,
             queries["confidence"],
             gt_project_valid,
             config,
-            order,
-            offsets,
+            bev_order,
+            bev_offsets,
             dilate_output=False,
         )
         gt_project_bev = cv2.dilate(gt_project_bev_raw, np.ones((3, 3), np.uint8))
@@ -1640,6 +1686,11 @@ def run_inference(
         "evaluation_gt_used": gt_used,
         "evaluation_gt_never_used_as_input_or_scale_alignment": prior_depth_path != evaluation_depth_path,
         "completed_semantics": "subpixel query rays are learned completion, not camera observations",
+        "bev_selection": (
+            "BEV에는 edge/confidence/NMS 조건을 통과한 query 중 학습된 "
+            f"bev_keep_probability >= {config.inference.bev_keep_threshold:.3f}인 point만 투영"
+        ),
+        "bev_selection_uses_postprocess": False,
         "limitations": [
             "NYU의 pinhole FOV와 raw depth sensor noise가 pseudo edge 품질을 제한함",
             "NYU indoor scene과 Isaac warehouse fisheye 사이 domain gap이 존재함",

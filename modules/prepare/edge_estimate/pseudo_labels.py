@@ -34,6 +34,8 @@ class EdgePseudoLabels:
     far_depth_z: np.ndarray
     normals: np.ndarray
     normal_valid: np.ndarray
+    bev_keep: np.ndarray
+    bev_keep_valid: np.ndarray
 
 
 def _shift(array: np.ndarray, dy: int, dx: int, fill: float | bool = np.nan) -> np.ndarray:
@@ -121,11 +123,97 @@ def _crease_cluster_evidence(
     return high & (same_surface_count >= 2) & enough_pairs, enough_pairs
 
 
+def _top_view_bev_keep(
+    depth_z: np.ndarray,
+    rays: np.ndarray,
+    valid: np.ndarray,
+    normals: np.ndarray,
+    normal_valid: np.ndarray,
+    edge: np.ndarray,
+    reliable: np.ndarray,
+    gravity_down_camera: np.ndarray,
+    config: EdgeDataConfig,
+) -> tuple[np.ndarray, np.ndarray]:
+    """중력 기준 top-facing이며 위에서 가려지지 않는 edge를 BEV 유지 표적으로 만든다.
+
+    NYU에는 별도 BEV annotation이 없으므로 dense RGB-D point cloud를 중력축에
+    수직인 평면으로 투영한다. 같은 top-view cell에서는 가장 높은 point만 보이는
+    것으로 간주하고, edge 주변에 위를 향한 표면이 있을 때만 ``bev_keep=1``이다.
+    측면 edge도 학습해야 하므로 안정된 edge 중 주변 normal을 계산할 수 있는 위치는
+    ``bev_keep_valid=1``로 두고, keep 조건을 만족하지 않으면 명시적인 negative가 된다.
+    """
+
+    gravity = np.asarray(gravity_down_camera, dtype=np.float32).reshape(3)
+    gravity_norm = float(np.linalg.norm(gravity))
+    if not np.isfinite(gravity_norm) or gravity_norm < 1.0e-6:
+        raise ValueError("gravity_down_camera must be a finite non-zero 3-vector")
+    gravity /= gravity_norm
+
+    depth = np.asarray(depth_z, dtype=np.float32)
+    ray_map = np.asarray(rays, dtype=np.float32)
+    point_valid = np.asarray(valid, dtype=bool) & (ray_map[..., 2] > 1.0e-6)
+    radial = np.divide(
+        depth,
+        ray_map[..., 2],
+        out=np.full_like(depth, np.nan),
+        where=point_valid,
+    )
+    points = radial[..., None] * ray_map
+
+    # 카메라 forward를 중력 수직 평면에 투영해 top-view 평면의 두 축을 만든다.
+    forward = np.array([0.0, 0.0, 1.0], dtype=np.float32)
+    forward -= gravity * float(np.dot(forward, gravity))
+    if float(np.linalg.norm(forward)) < 1.0e-6:
+        forward = np.array([1.0, 0.0, 0.0], dtype=np.float32)
+        forward -= gravity * float(np.dot(forward, gravity))
+    forward /= np.linalg.norm(forward)
+    right = np.cross(gravity, forward)
+    right /= np.linalg.norm(right)
+
+    horizontal_x = np.sum(points * right, axis=-1)
+    horizontal_y = np.sum(points * forward, axis=-1)
+    height = -np.sum(points * gravity, axis=-1)
+    finite = point_valid & np.isfinite(horizontal_x) & np.isfinite(horizontal_y) & np.isfinite(height)
+    top_visible = np.zeros(depth.shape, dtype=bool)
+    if np.any(finite):
+        cell_size = max(float(config.bev_keep_cell_size_m), 1.0e-4)
+        keys = np.stack(
+            [
+                np.floor(horizontal_x[finite] / cell_size).astype(np.int64),
+                np.floor(horizontal_y[finite] / cell_size).astype(np.int64),
+            ],
+            axis=-1,
+        )
+        _, inverse = np.unique(keys, axis=0, return_inverse=True)
+        maximum_height = np.full(int(inverse.max()) + 1, -np.inf, dtype=np.float32)
+        np.maximum.at(maximum_height, inverse, height[finite])
+        visible_values = height[finite] >= (
+            maximum_height[inverse] - float(config.bev_keep_height_tolerance_m)
+        )
+        top_visible[finite] = visible_values
+
+    up = -gravity
+    top_cosine = np.abs(np.sum(normals * up, axis=-1))
+    top_facing = normal_valid & (
+        top_cosine >= np.cos(np.deg2rad(float(config.bev_keep_top_angle_degrees)))
+    )
+    radius = max(int(config.bev_keep_neighbor_radius_px), 0)
+    kernel_size = 2 * radius + 1
+    kernel = np.ones((kernel_size, kernel_size), dtype=np.uint8)
+    top_neighbor = cv2.dilate(top_facing.astype(np.uint8), kernel) > 0
+    normal_neighbor = cv2.dilate(normal_valid.astype(np.uint8), kernel) > 0
+
+    keep_valid = edge & reliable & normal_neighbor & finite
+    keep = keep_valid & top_neighbor & top_visible
+    return keep, keep_valid
+
+
 def build_pseudo_edges(
     depth_z: np.ndarray,
     raw_valid: np.ndarray,
     rays: np.ndarray,
     config: EdgeDataConfig,
+    gravity_down_camera: np.ndarray | None = None,
 ) -> EdgePseudoLabels:
     """RGB-D annotation 없이 depth discontinuity와 crease pseudo-GT를 만든다."""
 
@@ -208,6 +296,19 @@ def build_pseudo_edges(
     edge_soft[ignore] = 0.0
     confidence = np.clip(raw_fraction * stable.astype(np.float32), 0.0, 1.0)
     confidence[ignore] = 0.0
+    if gravity_down_camera is None:
+        gravity_down_camera = np.array([0.0, 1.0, 0.0], dtype=np.float32)
+    bev_keep, bev_keep_valid = _top_view_bev_keep(
+        depth,
+        ray_map,
+        valid,
+        normals,
+        normal_valid,
+        edge,
+        reliable,
+        gravity_down_camera,
+        config,
+    )
     return EdgePseudoLabels(
         edge=edge,
         edge_soft=edge_soft,
@@ -218,4 +319,6 @@ def build_pseudo_edges(
         far_depth_z=far.astype(np.float32),
         normals=normals,
         normal_valid=normal_valid,
+        bev_keep=bev_keep,
+        bev_keep_valid=bev_keep_valid,
     )

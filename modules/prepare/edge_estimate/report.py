@@ -31,6 +31,7 @@ LABELS = {
     "edge_3d_preview.png": "Camera XZ / World XY 3D edge 미리보기",
     "edge_probability.png": "Subpixel edge 확률",
     "edge_confidence.png": "Completion 신뢰도",
+    "bev_keep_probability.png": "학습된 BEV 유지 확률",
     "edge_type.png": "3D edge 종류",
     "edge_depth_near_z.png": "Near/crease metric z-depth",
     "edge_depth_far_z.png": "Occlusion far metric z-depth",

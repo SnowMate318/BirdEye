@@ -20,7 +20,7 @@ DEFAULT_TRAIN_VARIANTS: tuple[Variant, ...] = ("rgb_local", "rgb_context")
 class EdgeDataConfig:
     """NYU에서 연결된 2x2 cell patch와 pseudo edge GT를 만드는 설정."""
 
-    schema_version: int = 6
+    schema_version: int = 7
     orientations_degrees: tuple[tuple[float, float], ...] = (
         (0.0, 0.0),
         (-55.0, 0.0),
@@ -42,6 +42,10 @@ class EdgeDataConfig:
     stability_scales_px: tuple[int, ...] = (1, 2, 4)
     stability_min_count: int = 2
     edge_soft_sigma_px: float = 0.75
+    bev_keep_top_angle_degrees: float = 35.0
+    bev_keep_cell_size_m: float = 0.04
+    bev_keep_height_tolerance_m: float = 0.06
+    bev_keep_neighbor_radius_px: int = 1
     max_attempts_per_patch: int = 200
     max_train_frames: int | None = None
     max_test_frames: int | None = None
@@ -87,6 +91,7 @@ class EdgeLossConfig:
     near_depth_weight: float = 1.00
     far_depth_weight: float = 0.50
     confidence_weight: float = 0.20
+    bev_keep_weight: float = 0.50
     boundary_consistency_weight: float = 0.20
     tangent_weight: float = 0.05
     focal_alpha: float = 0.75
@@ -118,6 +123,7 @@ class EdgeInferenceConfig:
     coarse_threshold: float = 0.30
     query_edge_threshold: float = 0.30  #0.5
     confidence_threshold: float = 0.30  #0.5
+    bev_keep_threshold: float = 0.50
     coarse_batch_size: int = 512
     query_batch_size: int = 256
     candidate_dilation_cells: int = 1

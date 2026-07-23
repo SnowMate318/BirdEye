@@ -50,6 +50,7 @@ def test_three_variants_have_public_output_shapes() -> None:
         assert result.cell_edge_logit.shape == (2, 4, 4)
         assert result.cell_type_logits.shape == (2, 4, 4, 3)
         assert result.query_edge_logit.shape == (2, 4, 4, 64)
+        assert result.query_bev_keep_logit.shape == (2, 4, 4, 64)
         assert result.query_depth_near_z.shape == (2, 4, 4, 64)
         assert torch.all(result.query_depth_far_z >= result.query_depth_near_z)
 
@@ -100,6 +101,8 @@ def test_loss_is_nan_safe_and_backpropagates() -> None:
         "target_near_valid": query_mask,
         "target_far_valid": torch.zeros_like(query_mask),
         "target_confidence": query_mask.float(),
+        "target_bev_keep": torch.randint(0, 2, (1, 4, 4, 64)).float(),
+        "target_bev_keep_valid": query_mask,
         "query_ray_dir": inputs[3],
     }
     loss = EdgeEstimateLoss(EdgeLossConfig())(result, batch)
@@ -127,6 +130,8 @@ def test_empty_masks_make_depth_type_and_consistency_graph_zeros() -> None:
         "target_near_valid": empty_query,
         "target_far_valid": empty_query,
         "target_confidence": torch.full((1, 4, 4, 64), float("nan")),
+        "target_bev_keep": torch.full((1, 4, 4, 64), float("nan")),
+        "target_bev_keep_valid": empty_query,
         "query_ray_dir": inputs[3],
     }
     loss = EdgeEstimateLoss(EdgeLossConfig())(result, batch)
@@ -138,6 +143,7 @@ def test_empty_masks_make_depth_type_and_consistency_graph_zeros() -> None:
         loss.near_depth,
         loss.far_depth,
         loss.confidence,
+        loss.bev_keep,
         loss.boundary_consistency,
         loss.tangent,
     ):
@@ -196,6 +202,7 @@ def test_small_image_inference_writes_query_bev_and_report(tmp_path: Path) -> No
     config.inference.coarse_threshold = 0.0
     config.inference.query_edge_threshold = 0.0
     config.inference.confidence_threshold = 0.0
+    config.inference.bev_keep_threshold = 0.0
     config.inference.candidate_dilation_cells = 0
     config.inference.max_candidate_cells = 32
     config.inference.coarse_batch_size = 16
@@ -226,8 +233,11 @@ def test_small_image_inference_writes_query_bev_and_report(tmp_path: Path) -> No
     assert (variant / "edge_only" / "bev_edge_polyline.png").exists()
     assert (variant / "edge_only" / "bev_edge_occupancy.png").exists()
     assert (variant / "edge_only" / "bev_edge_projected_with_gt_depth.png").exists()
+    assert (variant / "bev_keep_probability.png").exists()
     assert (variant / "gt" / "bev_edge_gt.png").exists()
     assert (run_dir / "index.html").exists()
     with np.load(variant / "edge_queries.npz") as queries:
         assert len(queries["ray_dir"]) > 0
         assert np.all(queries["completed"] == ~queries["unknown"])
+        assert "bev_keep_probability" in queries
+        assert "bev_selected" in queries

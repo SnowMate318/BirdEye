@@ -22,6 +22,7 @@ class EdgeEstimateResult:
     query_depth_near_z: torch.Tensor
     query_depth_far_z: torch.Tensor
     query_confidence_logit: torch.Tensor
+    query_bev_keep_logit: torch.Tensor
     query_delta_log_depth: torch.Tensor
 
 
@@ -61,7 +62,7 @@ class EdgeEstimateModel(nn.Module):
             raise ValueError(f"지원하지 않는 edge model variant입니다: {variant}")
         self.config = config
         self.variant = variant
-        self.checkpoint_schema = f"edge_estimate_{variant}_v3"
+        self.checkpoint_schema = f"edge_estimate_{variant}_v4"
         self.log_depth_mean = float(config.log_depth_mean if log_depth_mean is None else log_depth_mean)
         self.log_depth_std = max(float(config.log_depth_std if log_depth_std is None else log_depth_std), 1.0e-3)
         point_hidden = int(config.point_hidden_dim)
@@ -91,7 +92,7 @@ class EdgeEstimateModel(nn.Module):
             nn.GELU(),
             nn.Linear(query_hidden, query_hidden),
             nn.GELU(),
-            nn.Linear(query_hidden, 6),
+            nn.Linear(query_hidden, 7),
         )
 
     def encode_cells(
@@ -180,7 +181,7 @@ class EdgeEstimateModel(nn.Module):
         query_relative_uv: torch.Tensor,
         query_prior_depth_z: torch.Tensor | None = None,
         query_prior_valid: torch.Tensor | None = None,
-    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
         """각 cell query에서 edge와 near/far depth를 예측한다."""
 
         batch = cell_features.shape[0]
@@ -194,7 +195,7 @@ class EdgeEstimateModel(nn.Module):
             torch.cat([cells, torch.nan_to_num(query_ray_dir), torch.nan_to_num(query_relative_uv)], dim=-1)
         )
         near, far, delta = self._depth_from_prior(decoded, query_prior_depth_z, query_prior_valid)
-        return decoded[..., 0], near, far, decoded[..., 3], delta
+        return decoded[..., 0], near, far, decoded[..., 3], decoded[..., 6], delta
 
     def decode_selected_queries(
         self,
@@ -203,7 +204,7 @@ class EdgeEstimateModel(nn.Module):
         query_relative_uv: torch.Tensor,
         query_prior_depth_z: torch.Tensor | None = None,
         query_prior_valid: torch.Tensor | None = None,
-    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
         """coarse scan에서 선택된 cell만 `(B,Q)` 형태로 정밀 추론한다."""
 
         if cell_features.ndim != 2:
@@ -217,7 +218,7 @@ class EdgeEstimateModel(nn.Module):
             torch.cat([expanded, torch.nan_to_num(query_ray_dir), torch.nan_to_num(query_relative_uv)], dim=-1)
         )
         near, far, delta = self._depth_from_prior(decoded, query_prior_depth_z, query_prior_valid)
-        return decoded[..., 0], near, far, decoded[..., 3], delta
+        return decoded[..., 0], near, far, decoded[..., 3], decoded[..., 6], delta
 
     def forward(
         self,
@@ -237,7 +238,7 @@ class EdgeEstimateModel(nn.Module):
         cells, cell_edge, cell_type = self.encode_cells(
             support_rgb, support_ray_dir, support_valid, da_relative_log_depth, da_valid, support_edge_2d
         )
-        query_edge, near, far, confidence, delta = self.decode_queries(
+        query_edge, near, far, confidence, bev_keep, delta = self.decode_queries(
             cells, query_ray_dir, query_relative_uv, query_prior_depth_z, query_prior_valid
         )
         return EdgeEstimateResult(
@@ -247,5 +248,6 @@ class EdgeEstimateModel(nn.Module):
             query_depth_near_z=near,
             query_depth_far_z=far,
             query_confidence_logit=confidence,
+            query_bev_keep_logit=bev_keep,
             query_delta_log_depth=delta,
         )

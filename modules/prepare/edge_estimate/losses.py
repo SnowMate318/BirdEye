@@ -22,6 +22,7 @@ class EdgeLossResult:
     near_depth: torch.Tensor
     far_depth: torch.Tensor
     confidence: torch.Tensor
+    bev_keep: torch.Tensor
     boundary_consistency: torch.Tensor
     tangent: torch.Tensor
 
@@ -204,6 +205,13 @@ class EdgeEstimateLoss:
             query_mask,
             result.query_confidence_logit,
         )
+        bev_keep = _focal_bce(
+            result.query_bev_keep_logit,
+            batch["target_bev_keep"],
+            batch["target_bev_keep_valid"].bool() & query_mask,
+            alpha=self.config.focal_alpha,
+            gamma=self.config.focal_gamma,
+        )
         consistency = _shared_boundary_consistency(result, query_mask)
         tangent = _tangent_loss(
             result,
@@ -220,6 +228,7 @@ class EdgeEstimateLoss:
             + self.config.near_depth_weight * near_depth
             + self.config.far_depth_weight * far_depth
             + self.config.confidence_weight * confidence
+            + self.config.bev_keep_weight * bev_keep
             + self.config.boundary_consistency_weight * consistency
             + self.config.tangent_weight * tangent
         )
@@ -232,6 +241,7 @@ class EdgeEstimateLoss:
             near_depth=near_depth,
             far_depth=far_depth,
             confidence=confidence,
+            bev_keep=bev_keep,
             boundary_consistency=consistency,
             tangent=tangent,
         )

@@ -205,6 +205,10 @@ def _make_patch(
     query_edge = _sample_bilinear(labels.edge_soft, query_xy).astype(np.float32)
     query_type = _sample_nearest(labels.edge_type, query_xy).astype(np.int64)
     query_confidence = _sample_bilinear(labels.confidence, query_xy).astype(np.float32)
+    query_bev_keep = _sample_nearest(labels.bev_keep.astype(np.uint8), query_xy).astype(np.float32)
+    query_bev_keep_valid = _sample_nearest(
+        labels.bev_keep_valid.astype(np.uint8), query_xy
+    ).astype(bool)
     query_ignore = _sample_nearest(labels.ignore.astype(np.uint8), query_xy).astype(bool)
     query_near, near_weight = _sample_bilinear_masked(
         labels.near_depth_z, np.isfinite(labels.near_depth_z), query_xy
@@ -235,6 +239,7 @@ def _make_patch(
         & support_valid[1:, :-1]
     )
     query_valid &= cell_valid[..., None]
+    query_bev_keep_valid &= query_valid & (query_edge >= 0.5)
     high_confidence = query_confidence >= 0.5
     near_valid = query_valid & high_confidence & (query_edge >= 0.5) & (query_type > 0) & (query_near > 0.0)
     near_valid &= ((query_type == 1) | (near_weight > 1.0e-6))
@@ -269,6 +274,8 @@ def _make_patch(
         "target_near_valid": near_valid,
         "target_far_valid": far_valid,
         "target_confidence": query_confidence,
+        "target_bev_keep": query_bev_keep,
+        "target_bev_keep_valid": query_bev_keep_valid,
         "cell_valid": cell_valid,
         "frame_index": np.array(frame_index, dtype=np.int32),
         "cell_span_px": np.array(span, dtype=np.int16),
@@ -360,7 +367,17 @@ def build_edge_cache(
             )
             raw_valid = raw_samples.gt_valid
             source_valid = rays.valid & virtual.source_observed & virtual.gt_valid
-            labels = build_pseudo_edges(virtual.depth_gt_z, raw_valid, rays.rays_cv, config.data)
+            gravity_down_fisheye = (
+                np.asarray(orientation.rotation_nyu_from_fisheye, dtype=np.float32).T
+                @ np.array([0.0, 1.0, 0.0], dtype=np.float32)
+            )
+            labels = build_pseudo_edges(
+                virtual.depth_gt_z,
+                raw_valid,
+                rays.rays_cv,
+                config.data,
+                gravity_down_camera=gravity_down_fisheye,
+            )
             edge_prior_2d = (
                 estimate_2d_edge_prior(virtual.rgb, source_valid, config.edge_prior)
                 if config.edge_prior.enabled
