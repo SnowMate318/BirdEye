@@ -666,11 +666,22 @@ def train_variant(config: EdgeEstimateConfig, variant: Variant) -> Path:
 
 def _model_from_checkpoint(config: EdgeEstimateConfig, variant: Variant, checkpoint: Path, device: torch.device) -> EdgeEstimateModel:
     payload = torch.load(checkpoint, map_location="cpu", weights_only=False)
+    schema = str(payload.get("schema", ""))
+    expected_prefix = f"edge_estimate_{variant}_v"
+    if not schema.startswith(expected_prefix):
+        raise RuntimeError(
+            f"Edge checkpoint variant/schema 불일치: expected prefix={expected_prefix!r}, actual={schema!r}"
+        )
+    try:
+        checkpoint_version = int(schema[len(expected_prefix) :])
+    except ValueError as error:
+        raise RuntimeError(f"Edge checkpoint version을 해석할 수 없습니다: {schema!r}") from error
     model = EdgeEstimateModel(
         config.model,
         variant,
         log_depth_mean=float(payload.get("log_depth_mean", config.model.log_depth_mean)),
         log_depth_std=float(payload.get("log_depth_std", config.model.log_depth_std)),
+        checkpoint_version=checkpoint_version,
     ).to(device)
     load_checkpoint(checkpoint, model, map_location=device)
     return model.eval()

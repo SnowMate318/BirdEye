@@ -202,7 +202,7 @@ def test_small_image_inference_writes_query_bev_and_report(tmp_path: Path) -> No
     config.inference.coarse_threshold = 0.0
     config.inference.query_edge_threshold = 0.0
     config.inference.confidence_threshold = 0.0
-    config.inference.bev_keep_threshold = 0.0
+    config.inference.bev_keep_threshold = 0.5
     config.inference.candidate_dilation_cells = 0
     config.inference.max_candidate_cells = 32
     config.inference.coarse_batch_size = 16
@@ -214,7 +214,7 @@ def test_small_image_inference_writes_query_bev_and_report(tmp_path: Path) -> No
     evaluation_depth[:, 8:] = 4.0
     evaluation_depth_path = tmp_path / "depth.npy"
     np.save(evaluation_depth_path, evaluation_depth)
-    model = EdgeEstimateModel(config.model, "rgb_local")
+    model = EdgeEstimateModel(config.model, "rgb_local", checkpoint_version=3)
     checkpoint = tmp_path / "model.pt"
     save_checkpoint(checkpoint, model, None, 0, {})
 
@@ -241,3 +241,4 @@ def test_small_image_inference_writes_query_bev_and_report(tmp_path: Path) -> No
         assert np.all(queries["completed"] == ~queries["unknown"])
         assert "bev_keep_probability" in queries
         assert "bev_selected" in queries
+        assert np.all(queries["bev_selected"] == queries["completed"])

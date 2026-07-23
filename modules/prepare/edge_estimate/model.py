@@ -56,13 +56,17 @@ class EdgeEstimateModel(nn.Module):
         *,
         log_depth_mean: float | None = None,
         log_depth_std: float | None = None,
+        checkpoint_version: int = 4,
     ) -> None:
         super().__init__()
         if variant not in VARIANTS:
             raise ValueError(f"지원하지 않는 edge model variant입니다: {variant}")
         self.config = config
         self.variant = variant
-        self.checkpoint_schema = f"edge_estimate_{variant}_v4"
+        if checkpoint_version not in (3, 4):
+            raise ValueError(f"지원하지 않는 edge checkpoint version입니다: v{checkpoint_version}")
+        self.checkpoint_version = int(checkpoint_version)
+        self.checkpoint_schema = f"edge_estimate_{variant}_v{self.checkpoint_version}"
         self.log_depth_mean = float(config.log_depth_mean if log_depth_mean is None else log_depth_mean)
         self.log_depth_std = max(float(config.log_depth_std if log_depth_std is None else log_depth_std), 1.0e-3)
         point_hidden = int(config.point_hidden_dim)
@@ -92,7 +96,7 @@ class EdgeEstimateModel(nn.Module):
             nn.GELU(),
             nn.Linear(query_hidden, query_hidden),
             nn.GELU(),
-            nn.Linear(query_hidden, 7),
+            nn.Linear(query_hidden, 7 if self.checkpoint_version >= 4 else 6),
         )
 
     def encode_cells(
@@ -195,7 +199,12 @@ class EdgeEstimateModel(nn.Module):
             torch.cat([cells, torch.nan_to_num(query_ray_dir), torch.nan_to_num(query_relative_uv)], dim=-1)
         )
         near, far, delta = self._depth_from_prior(decoded, query_prior_depth_z, query_prior_valid)
-        return decoded[..., 0], near, far, decoded[..., 3], decoded[..., 6], delta
+        bev_keep = (
+            decoded[..., 6]
+            if self.checkpoint_version >= 4
+            else torch.full_like(decoded[..., 0], 20.0)
+        )
+        return decoded[..., 0], near, far, decoded[..., 3], bev_keep, delta
 
     def decode_selected_queries(
         self,
@@ -218,7 +227,12 @@ class EdgeEstimateModel(nn.Module):
             torch.cat([expanded, torch.nan_to_num(query_ray_dir), torch.nan_to_num(query_relative_uv)], dim=-1)
         )
         near, far, delta = self._depth_from_prior(decoded, query_prior_depth_z, query_prior_valid)
-        return decoded[..., 0], near, far, decoded[..., 3], decoded[..., 6], delta
+        bev_keep = (
+            decoded[..., 6]
+            if self.checkpoint_version >= 4
+            else torch.full_like(decoded[..., 0], 20.0)
+        )
+        return decoded[..., 0], near, far, decoded[..., 3], bev_keep, delta
 
     def forward(
         self,
