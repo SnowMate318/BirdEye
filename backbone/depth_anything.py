@@ -7,6 +7,7 @@ import sys
 import cv2
 import numpy as np
 import torch
+import torch.nn.functional as F
 
 from wide_fov_supervision_v2.config import BackboneConfig, PathConfig
 
@@ -75,3 +76,28 @@ class DepthAnythingMetricWrapper:
         bgr = cv2.cvtColor(rgb, cv2.COLOR_RGB2BGR)
         depth = model.infer_image(bgr, int(self.config.da_input_size))
         return np.asarray(depth, dtype=np.float32)
+
+    @torch.inference_mode()
+    def predict_with_features(self, rgb: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+        """Return metric depth and four frozen DA-V2 intermediate feature maps.
+
+        Feature maps are DINOv2 token grids used by DA-V2's DPT head before DPT
+        projection. Shape is ``(4, C, Hp, Wp)`` and C is 1024 for ViT-L.
+        """
+
+        model = self.load()
+        bgr = cv2.cvtColor(rgb, cv2.COLOR_RGB2BGR)
+        image, (height, width) = model.image2tensor(bgr, int(self.config.da_input_size))
+        patch_h, patch_w = image.shape[-2] // 14, image.shape[-1] // 14
+        features = model.pretrained.get_intermediate_layers(
+            image,
+            model.intermediate_layer_idx[model.encoder],
+            return_class_token=True,
+        )
+        depth = model.depth_head(features, patch_h, patch_w) * model.max_depth
+        depth = F.interpolate(depth, (height, width), mode="bilinear", align_corners=True)[0, 0]
+        maps = []
+        for tokens, _cls in features:
+            fmap = tokens[0].permute(1, 0).reshape(tokens.shape[-1], patch_h, patch_w)
+            maps.append(fmap.detach().float().cpu().numpy())
+        return depth.detach().float().cpu().numpy().astype(np.float32), np.stack(maps, axis=0).astype(np.float32)
