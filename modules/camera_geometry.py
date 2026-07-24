@@ -6,7 +6,7 @@ from typing import Tuple
 import cv2
 import numpy as np
 
-from wide_fov_supervision_v2.config import FisheyeCameraConfig
+from wide_fov_supervision_v2.config import FisheyeCameraConfig, PinholeCameraConfig
 
 
 @dataclass(frozen=True)
@@ -26,7 +26,7 @@ class CameraRays:
     max_roundtrip_error_px: float
 
 
-def camera_matrix(camera: FisheyeCameraConfig) -> np.ndarray:
+def camera_matrix(camera: FisheyeCameraConfig | PinholeCameraConfig) -> np.ndarray:
     """OpenCV fisheye 함수에 넣는 3x3 intrinsics matrix를 만든다."""
 
     return np.array(
@@ -79,6 +79,17 @@ def unproject_fisheye_pixels(uv: np.ndarray, camera: FisheyeCameraConfig) -> np.
     return rays.reshape(*np.asarray(uv).shape[:-1], 3)
 
 
+def unproject_pinhole_pixels(uv: np.ndarray, camera: PinholeCameraConfig) -> np.ndarray:
+    """Unproject pixel-center coordinates into OpenCV pinhole camera-frame rays."""
+
+    points = np.asarray(uv, dtype=np.float64)
+    x = (points[..., 0] - float(camera.cx)) / float(camera.fx)
+    y = (points[..., 1] - float(camera.cy)) / float(camera.fy)
+    rays = np.stack([x, y, np.ones_like(x)], axis=-1)
+    rays /= np.linalg.norm(rays, axis=-1, keepdims=True).clip(min=1.0e-12)
+    return rays
+
+
 def project_fisheye_rays(rays_cv: np.ndarray, camera: FisheyeCameraConfig) -> tuple[np.ndarray, np.ndarray]:
     """OpenCV camera-frame ray를 fisheye pixel로 투영한다.
 
@@ -122,6 +133,45 @@ def project_fisheye_rays(rays_cv: np.ndarray, camera: FisheyeCameraConfig) -> tu
     return uv.reshape(*original_shape, 2), valid.reshape(original_shape)
 
 
+def project_pinhole_rays(rays_cv: np.ndarray, camera: PinholeCameraConfig) -> tuple[np.ndarray, np.ndarray]:
+    """Project OpenCV camera-frame rays to pinhole pixel-center coordinates."""
+
+    original_shape = np.asarray(rays_cv).shape[:-1]
+    rays = np.asarray(rays_cv, dtype=np.float64).reshape(-1, 3)
+    uv = np.full((len(rays), 2), np.nan, dtype=np.float64)
+    valid = np.isfinite(rays).all(axis=1) & (rays[:, 2] > 1.0e-8)
+    if np.any(valid):
+        xyz = rays[valid]
+        uv_valid = np.column_stack(
+            [
+                camera.fx * xyz[:, 0] / xyz[:, 2] + camera.cx,
+                camera.fy * xyz[:, 1] / xyz[:, 2] + camera.cy,
+            ]
+        )
+        inside = (
+            np.isfinite(uv_valid).all(axis=1)
+            & (uv_valid[:, 0] >= 0.5)
+            & (uv_valid[:, 0] <= float(camera.width) - 0.5)
+            & (uv_valid[:, 1] >= 0.5)
+            & (uv_valid[:, 1] <= float(camera.height) - 0.5)
+        )
+        valid_indices = np.flatnonzero(valid)
+        uv[valid_indices[inside]] = uv_valid[inside]
+        valid[valid_indices[~inside]] = False
+    return uv.reshape(*original_shape, 2), valid.reshape(original_shape)
+
+
+def project_camera_rays(
+    rays_cv: np.ndarray,
+    camera: FisheyeCameraConfig | PinholeCameraConfig,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Project rays with the camera model declared by the config object."""
+
+    if getattr(camera, "model", "fisheye") == "pinhole":
+        return project_pinhole_rays(rays_cv, camera)  # type: ignore[arg-type]
+    return project_fisheye_rays(rays_cv, camera)  # type: ignore[arg-type]
+
+
 def build_fisheye_rays(camera: FisheyeCameraConfig, *, validate_roundtrip: bool = True) -> CameraRays:
     """현재 fisheye 카메라의 source pixel ray map을 만든다.
 
@@ -145,6 +195,34 @@ def build_fisheye_rays(camera: FisheyeCameraConfig, *, validate_roundtrip: bool 
     rays = rays.astype(np.float32)
     rays[~valid] = 0.0
     return CameraRays(rays_cv=rays, valid=valid, max_roundtrip_error_px=max_error)
+
+
+def build_pinhole_rays(camera: PinholeCameraConfig, *, validate_roundtrip: bool = True) -> CameraRays:
+    """Build source pixel-center rays for an OpenCV pinhole camera."""
+
+    uv = pixel_grid(camera.width, camera.height, centers=True)
+    rays = unproject_pinhole_pixels(uv, camera)
+    projected, projected_valid = project_pinhole_rays(rays, camera)
+    error = np.linalg.norm(projected - uv, axis=-1)
+    valid = projected_valid & np.isfinite(error) & (error <= 1.0e-3)
+    max_error = float(np.max(error[valid])) if np.any(valid) else float("inf")
+    if validate_roundtrip and not np.any(valid):
+        raise RuntimeError("No valid pinhole ray was generated.")
+    rays = rays.astype(np.float32)
+    rays[~valid] = 0.0
+    return CameraRays(rays_cv=rays, valid=valid, max_roundtrip_error_px=max_error)
+
+
+def build_camera_rays(
+    camera: FisheyeCameraConfig | PinholeCameraConfig,
+    *,
+    validate_roundtrip: bool = True,
+) -> CameraRays:
+    """Build pixel-center rays using fisheye or pinhole config."""
+
+    if getattr(camera, "model", "fisheye") == "pinhole":
+        return build_pinhole_rays(camera, validate_roundtrip=validate_roundtrip)  # type: ignore[arg-type]
+    return build_fisheye_rays(camera, validate_roundtrip=validate_roundtrip)  # type: ignore[arg-type]
 
 
 def angular_distance(a: np.ndarray, b: np.ndarray) -> np.ndarray:
@@ -248,7 +326,7 @@ def points_from_z_depth(
 
 def camera_to_world_points(
     points_cv: np.ndarray,
-    camera: FisheyeCameraConfig,
+    camera: FisheyeCameraConfig | PinholeCameraConfig,
 ) -> np.ndarray:
     """OpenCV camera-frame point를 world point로 변환한다."""
 

@@ -26,10 +26,12 @@ from tqdm import tqdm
 
 from wide_fov_supervision_v2.backbone.depth_anything import DepthAnythingMetricWrapper
 from wide_fov_supervision_v2.modules.camera_geometry import (
+    build_camera_rays,
     build_fisheye_rays,
     camera_to_world_points,
     cell_angular_gap,
     points_from_z_depth,
+    project_camera_rays,
     project_fisheye_rays,
 )
 from wide_fov_supervision_v2.modules.visualization import save_depth, save_heatmap, save_rgb
@@ -789,7 +791,7 @@ def validate_environment(config: EdgeEstimateConfig, input_rgb: Path | None = No
     """파일, CUDA, fisheye round-trip, 평가 depth shape를 변경 없이 검사한다."""
     input_rgb = input_rgb or config.base.paths.input_rgb
     evaluation_depth = evaluation_depth or config.base.paths.external_depth_z
-    rays = build_fisheye_rays(config.base.camera)
+    rays = build_camera_rays(config.base.camera)
     result = {
         "device": str(_device()),
         "torch": torch.__version__,
@@ -928,7 +930,7 @@ def _query_rays_for_cells(
     for index, (y, x) in enumerate(cells_yx):
         corners = np.stack([rays[y, x], rays[y, x + 1], rays[y + 1, x + 1], rays[y + 1, x]])
         query_rays[index] = spherical_bilerp(corners[None], relative[None])[0]
-        projected, _ = project_fisheye_rays(query_rays[index], config.base.camera)
+        projected, _ = project_camera_rays(query_rays[index], config.base.camera)
         source_uv[index] = projected.astype(np.float32)
     return query_rays, source_uv
 
@@ -1533,7 +1535,7 @@ def run_inference(
     expected_shape = (config.base.camera.height, config.base.camera.width)
     if rgb.shape[:2] != expected_shape:
         raise ValueError(f"입력 RGB shape {rgb.shape[:2]} != camera shape {expected_shape}")
-    rays_result = build_fisheye_rays(config.base.camera)
+    rays_result = build_camera_rays(config.base.camera)
     rays, valid = rays_result.rays_cv, rays_result.valid
     if base_bev_run is not None:
         _validate_base_bev_run(base_bev_run, config)

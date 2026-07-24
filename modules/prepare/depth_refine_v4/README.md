@@ -79,6 +79,19 @@ python modules\prepare\depth_refine_v4\run.py --mode infer `
   --evaluation-depth compare\depth_z.npy
 ```
 
+`pinhole.png`를 pinhole camera geometry로 복원:
+
+```powershell
+python modules\prepare\depth_refine_v4\run.py --mode infer `
+  --camera-config pinhole_world `
+  --input-rgb pinhole.png `
+  --evaluation-depth compare\pinhole_depth.npy
+```
+
+`--camera-config fisheye`는 기본값이며 기존 fisheye ray map을 사용합니다.
+`--camera-config pinhole_world`는 `World_Camera_parameters.txt`의 pinholeOpenCV 값을
+1024x1024 viewport 기준으로 스케일한 intrinsics와 world pose를 사용합니다.
+
 이미 계산해 둔 V2 edge run을 재사용할 때:
 
 ```powershell
@@ -113,4 +126,3 @@ python modules\prepare\depth_refine_v4\run.py --mode infer `
 
 V4는 전역 scale을 새로 추정하지 않습니다. DA-V2의 scale 오류는 별도 calibration 문제로 남겨두고,
 이 패키지는 edge 주변의 번짐, 잘못된 layer, boundary consistency를 줄이는 방향만 학습합니다.
-

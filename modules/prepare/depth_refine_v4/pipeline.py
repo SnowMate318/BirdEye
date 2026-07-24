@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import json
+import hashlib
+import shutil
 import time
 from pathlib import Path
 
@@ -13,7 +15,7 @@ from tqdm import tqdm
 
 from wide_fov_supervision_v2.backbone.depth_anything import DepthAnythingMetricWrapper
 from wide_fov_supervision_v2.modules.bev_mapping import build_bev_rgb
-from wide_fov_supervision_v2.modules.camera_geometry import build_fisheye_rays, camera_to_world_points, points_from_z_depth
+from wide_fov_supervision_v2.modules.camera_geometry import build_camera_rays, camera_to_world_points, points_from_z_depth
 from wide_fov_supervision_v2.modules.visualization import save_depth, save_heatmap, save_rgb
 
 from .config import DepthRefineV4Config, save_v4_config
@@ -183,13 +185,14 @@ def run_inference(
 ) -> Path:
     input_path = input_rgb or config.base.paths.input_rgb
     rgb = np.asarray(Image.open(input_path).convert("RGB"), dtype=np.uint8)
-    rays_data = build_fisheye_rays(config.base.camera)
+    rays_data = build_camera_rays(config.base.camera)
     rays = rays_data.rays_cv
     source_valid = rays_data.valid & (rays[..., 2] > config.base.camera.geometry_z_eps)
     if rgb.shape[:2] != source_valid.shape:
         rgb = cv2.resize(rgb, (config.base.camera.width, config.base.camera.height), interpolation=cv2.INTER_AREA)
     da_features = None
     if depth0_path is not None:
+        _guard_optional_run_input_match(depth0_path.parent / "metadata.json", input_path, "depth0")
         depth0 = np.asarray(np.load(depth0_path), dtype=np.float32)
         _unused_depth, da_features = DepthAnythingMetricWrapper(config.base.paths, config.base.backbone).predict_with_features(rgb)
     else:
@@ -198,7 +201,11 @@ def run_inference(
         depth0 = cv2.resize(depth0.astype(np.float32), (config.base.camera.width, config.base.camera.height), interpolation=cv2.INTER_LINEAR)
     run_dir = config.output_root / "inference" / time.strftime("%Y_%m_%d_%H_%M_%S")
     run_dir.mkdir(parents=True, exist_ok=True)
-    save_rgb(run_dir / "source_rgb.png", rgb)
+    _save_input_rgb_copy(input_path, run_dir / "source_rgb.png")
+    if rgb.shape[:2] == source_valid.shape:
+        _save_input_rgb_copy(input_path, run_dir / "model_input_rgb.png")
+    else:
+        save_rgb(run_dir / "model_input_rgb.png", rgb)
     np.save(run_dir / "depth0_z.npy", depth0.astype(np.float32))
     save_depth(run_dir / "depth0_z.png", depth0)
 
@@ -276,6 +283,15 @@ def run_inference(
         save_heatmap(run_dir / "depth_error_final.png", np.where(valid, np.abs(depth_final - gt), np.nan), cmap_name="magma")
     metadata = {
         "input_rgb": str(input_path),
+        "input_rgb_sha256": _sha256(input_path),
+        "camera_model": getattr(config.base.camera, "model", "fisheye"),
+        "camera_width": int(config.base.camera.width),
+        "camera_height": int(config.base.camera.height),
+        "camera_fx": float(config.base.camera.fx),
+        "camera_fy": float(config.base.camera.fy),
+        "camera_cx": float(config.base.camera.cx),
+        "camera_cy": float(config.base.camera.cy),
+        "camera_position_world": list(config.base.camera.camera_position_world),
         "checkpoint": checkpoint_used,
         "edge_condition_source": edge_source,
         "evaluation_depth_used_as_input": False,
@@ -348,6 +364,7 @@ def latest_v2_context_checkpoint(config: DepthRefineV4Config) -> Path | None:
 
 def _ensure_v2_edge_run(config: DepthRefineV4Config, run_dir: Path, input_rgb: Path, edge_run: Path | None, depth0_path: Path) -> Path | None:
     if edge_run is not None:
+        _guard_optional_run_input_match(edge_run / "metadata.json", input_rgb, "edge_run")
         variant = edge_run / config.inference.edge_variant
         return variant if variant.exists() else edge_run
     if not config.inference.run_v2_if_missing:
@@ -359,6 +376,7 @@ def _ensure_v2_edge_run(config: DepthRefineV4Config, run_dir: Path, input_rgb: P
     from wide_fov_supervision_v2.modules.prepare.edge_estimate_v2.pipeline import run_inference as run_v2_inference
 
     edge_config = make_edge_config()
+    edge_config.base.camera = config.base.camera
     v2_dir = run_v2_inference(
         edge_config,
         {"rgb_context": ckpt},
@@ -369,6 +387,44 @@ def _ensure_v2_edge_run(config: DepthRefineV4Config, run_dir: Path, input_rgb: P
     )
     (run_dir / "v2_edge_run.txt").write_text(str(v2_dir), encoding="utf-8")
     return v2_dir / "rgb_context"
+
+
+def _sha256(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as handle:
+        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def _save_input_rgb_copy(input_path: Path, output_path: Path) -> None:
+    """Save the exact user-selected input image in the report slot."""
+
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    if input_path.suffix.lower() == ".png":
+        shutil.copyfile(input_path, output_path)
+        return
+    image = Image.open(input_path).convert("RGB")
+    image.save(output_path)
+
+
+def _guard_optional_run_input_match(metadata_path: Path, input_rgb: Path, label: str) -> None:
+    """Reject reused artifacts that were generated from a different RGB image."""
+
+    if not metadata_path.exists():
+        return
+    try:
+        metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
+    except json.JSONDecodeError:
+        return
+    expected = _sha256(input_rgb).lower()
+    actual = str(metadata.get("input_rgb_sha256", "")).lower()
+    if actual and actual != expected:
+        raise ValueError(
+            f"{label} artifact was generated from a different RGB image. "
+            f"expected input hash={expected}, artifact hash={actual}. "
+            "Use a matching artifact or omit the option so V4 regenerates it."
+        )
 
 
 def _depth_metrics(result, target, valid) -> dict[str, float]:

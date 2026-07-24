@@ -28,6 +28,12 @@ def _parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="V4 Depth Anything V2 edge-conditioned depth refinement")
     parser.add_argument("--mode", choices=("validate", "cache", "train", "evaluate", "infer", "all"), required=True)
     parser.add_argument("--input-rgb", type=str, default=None)
+    parser.add_argument(
+        "--camera-config",
+        choices=("fisheye", "pinhole_world"),
+        default="fisheye",
+        help="Camera/ray geometry used for inference and BEV restoration.",
+    )
     parser.add_argument("--evaluation-depth", type=str, default=None)
     parser.add_argument("--depth0", type=str, default=None, help="Optional precomputed D0 npy. If omitted, DA-V2 is used.")
     parser.add_argument("--edge-run", type=str, default=None, help="Optional V2 inference run directory.")
@@ -45,6 +51,8 @@ def _parser() -> argparse.ArgumentParser:
 def main() -> int:
     args = _parser().parse_args()
     config = make_v4_config()
+    if args.camera_config == "pinhole_world":
+        config.base.camera = config.base.pinhole_camera
     if args.max_train_frames is not None:
         config.data.train_frames = args.max_train_frames
     if args.max_test_frames is not None:
@@ -102,4 +110,3 @@ def main() -> int:
 
 if __name__ == "__main__":
     raise SystemExit(main())
-

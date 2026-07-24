@@ -75,7 +75,29 @@ class FisheyeCameraConfig:
         (0.0, 1.0, 0.0),
         (0.0, 0.0, -1.0),
     )
-    camera_position_world: tuple[float, float, float] = (-2.0, 12.0, 10.0)
+    camera_position_world: tuple[float, float, float] = (-2.0, 12.0, 14.0)
+
+
+@dataclass
+class PinholeCameraConfig:
+    """OpenCV pinhole camera config used for pinhole.png inference/BEV restoration."""
+
+    model: str = "pinhole"
+    width: int = 1024
+    height: int = 1024
+    fx: float = 886.8099975585938
+    fy: float = 886.8099975585938
+    cx: float = 512.0
+    cy: float = 512.0
+    clipping_near_m: float = 0.009999999776482582
+    clipping_far_m: float = 10000000.0
+    geometry_z_eps: float = 1.0e-3
+    world_from_camera: tuple[tuple[float, float, float], ...] = (
+        (-1.0, 0.0, 0.0),
+        (0.0, 1.0, 0.0),
+        (0.0, 0.0, -1.0),
+    )
+    camera_position_world: tuple[float, float, float] = (-2.0, 12.0, 11.436856389045715)
 
 
 @dataclass
@@ -219,6 +241,7 @@ class PipelineConfig:
 
     paths: PathConfig = field(default_factory=PathConfig)
     camera: FisheyeCameraConfig = field(default_factory=FisheyeCameraConfig)
+    pinhole_camera: PinholeCameraConfig = field(default_factory=PinholeCameraConfig)
     ray: RaySamplerConfig = field(default_factory=RaySamplerConfig)
     backbone: BackboneConfig = field(default_factory=BackboneConfig)
     completion: CompletionConfig = field(default_factory=CompletionConfig)
